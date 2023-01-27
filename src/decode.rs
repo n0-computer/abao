@@ -35,17 +35,20 @@
 //! # }
 //! ```
 
-use crate::encode;
-use crate::encode::NextRead;
+use crate::encode::{self, NextRead};
 use crate::{Finalization, Hash, CHUNK_SIZE, HEADER_SIZE, MAX_DEPTH, PARENT_SIZE};
 use arrayref::array_ref;
 use arrayvec::ArrayVec;
-use std::cmp;
+use tokio::io::{AsyncRead, ReadBuf};
+use std::{cmp, task};
+use std::convert::TryInto;
 use std::error;
 use std::fmt;
 use std::io;
 use std::io::prelude::*;
 use std::io::SeekFrom;
+use std::pin::Pin;
+use std::task::{Context, ready};
 
 /// Decode an entire slice in the default combined mode into a bytes vector.
 /// This is a convenience wrapper around `Decoder`.
@@ -205,7 +208,7 @@ impl From<Error> for io::Error {
 
 // Shared between Decoder and SliceDecoder.
 #[derive(Clone)]
-struct DecoderShared<T: Read, O: Read> {
+struct DecoderShared<T, O> {
     input: T,
     outboard: Option<O>,
     state: VerifyState,
@@ -214,7 +217,7 @@ struct DecoderShared<T: Read, O: Read> {
     buf_end: usize,
 }
 
-impl<T: Read, O: Read> DecoderShared<T, O> {
+impl<T, O> DecoderShared<T, O> {
     fn new(input: T, outboard: Option<O>, hash: &Hash) -> Self {
         Self {
             input,
@@ -240,6 +243,10 @@ impl<T: Read, O: Read> DecoderShared<T, O> {
         self.buf_start = 0;
         self.buf_end = 0;
     }
+}
+
+/// sync io utilities requiring just read
+impl<T: Read, O: Read> DecoderShared<T, O> {
 
     // These bytes are always verified before going in the buffer.
     fn take_buffered_bytes(&mut self, output: &mut [u8]) -> usize {
@@ -411,6 +418,7 @@ impl<T: Read, O: Read> DecoderShared<T, O> {
     }
 }
 
+/// sync io utilities requiing read and seek
 impl<T: Read + Seek, O: Read + Seek> DecoderShared<T, O> {
     // The Decoder will call this as part of seeking, but note that the
     // SliceDecoder won't, because all the seek bookkeeping has already been
@@ -441,7 +449,182 @@ impl<T: Read + Seek, O: Read + Seek> DecoderShared<T, O> {
     }
 }
 
-impl<T: Read, O: Read> fmt::Debug for DecoderShared<T, O> {
+// tokio flavour async io utilities, requiing AsyncRead
+impl<T: AsyncRead + Unpin, O: AsyncRead + Unpin> DecoderShared<T, O> {
+
+    fn poll_read(&mut self, cx: &mut Context, buf: &mut ReadBuf<'_>) -> task::Poll<io::Result<()>> {
+        // Explicitly short-circuit zero-length reads. We're within our rights
+        // to buffer an internal chunk in this case, or to make progress if
+        // there's an empty chunk, but this matches the current behavior of
+        // SliceExtractor for zero-length slices. This might change in the
+        // future.
+        if buf.remaining() == 0 {
+            return task::Poll::Ready(Ok(()));
+        }
+
+        // Otherwise try to verify a new chunk.
+        loop {
+
+            // If there are bytes in the internal buffer, just return those.
+            if self.buf_len() > 0 {
+                let n = cmp::min(buf.remaining(), self.buf_len());
+                buf.put_slice(&self.buf[self.buf_start..self.buf_start + n]);
+                self.buf_start += n;
+                // if we are done with writing, go into the reading state
+                if self.buf_len() == 0 {
+                    self.clear_buf();
+                }
+                return task::Poll::Ready(Ok(()));
+            }
+
+            match self.state.read_next() {
+                NextRead::Done => {
+                    // This is EOF. We know the internal buffer is empty,
+                    // because we checked it before this loop.
+                    return task::Poll::Ready(Ok(()));
+                }
+                NextRead::Header => {
+                    // ensure reading state, reading 8 bytes
+                    // we might already be in the reading state,
+                    // so we must not set buf_start to 0
+                    self.buf_end = 8;
+                    // header comes from outboard if we have one, otherwise from input
+                    ready!(self.poll_fill_buffer_from_input_or_outboard(cx))?;
+                    self.state.feed_header(self.buf[0..8].try_into().unwrap());
+                    // we don't want to write the header, so we are done with the buffer contents
+                    self.clear_buf();
+                }
+                NextRead::Parent => {
+                    // ensure reading state, reading 64 bytes
+                    // we might already be in the reading state,
+                    // so we must not set buf_start to 0
+                    self.buf_end = 64;
+                    // parent comes from outboard if we have one, otherwise from input
+                    ready!(self.poll_fill_buffer_from_input_or_outboard(cx))?;
+                    self.state.feed_parent(&self.buf[0..64].try_into().unwrap())?;
+                    // we don't want to write the parent, so we are done with the buffer contents
+                    self.clear_buf();
+                }
+                NextRead::Chunk {
+                    size,
+                    finalization,
+                    skip,
+                    index,
+                } => {
+                    // todo: add direct output optimization
+
+                    // ensure reading state, reading size bytes
+                    // we might already be in the reading state,
+                    // so we must not set buf_start to 0
+                    self.buf_end = size;
+                    // chunk never comes from outboard
+                    ready!(self.poll_fill_buffer_from_input(cx))?;
+                    
+                    // Hash it and push its hash into the VerifyState. This
+                    // returns an error if the hash is bad. Otherwise, the
+                    // chunk is verified.
+                    let read_buf = &self.buf[0..size];
+                    let chunk_hash = blake3::guts::ChunkState::new(index)
+                        .update(read_buf)
+                        .finalize(finalization.is_root());
+                    self.state.feed_chunk(&chunk_hash)?;
+
+                    // we go into the writing state now, starting from skip
+                    self.buf_start = skip;
+                    // we should have something to write,
+                    // unless the entire chunk was empty
+                    debug_assert!(self.buf_len() > 0 || size == 0);
+                }
+            }
+        }
+    }
+
+    // Returns Ok(true) to indicate the seek is finished. Note that both the
+    // Decoder and the SliceDecoder will use this method (which doesn't depend on
+    // io::Seek), but only the Decoder will call handle_seek_bookkeeping first.
+    // This may read a chunk, but it never leaves output bytes in the buffer,
+    // because the only time seeking reads a chunk it also skips the entire
+    // thing.
+    fn poll_handle_seek_read(&mut self, next: NextRead, cx: &mut Context) -> task::Poll<io::Result<bool>> {
+        debug_assert_eq!(0, self.buf_len());
+        std::task::Poll::Ready(Ok(match next {
+            NextRead::Header => {
+                // header comes from outboard if we have one, otherwise from input
+                self.buf_end = 8;
+                ready!(self.poll_fill_buffer_from_input_or_outboard(cx))?;
+                self.state.feed_header(self.buf[0..8].try_into().unwrap());
+                self.buf_start = 0;
+                false
+            }
+            NextRead::Parent => {
+                // parent comes from outboard if we have one, otherwise from input
+                self.buf_end = 64;
+                ready!(self.poll_fill_buffer_from_input_or_outboard(cx))?;
+                self.state.feed_parent(&self.buf[0..64].try_into().unwrap())?;
+                self.buf_start = 0;
+                false
+            }
+            NextRead::Chunk {
+                size,
+                finalization,
+                skip,
+                index,
+            } => {
+                // chunk always comes from input
+                self.buf_end = size;
+                ready!(self.poll_fill_buffer_from_input(cx))?;
+                let chunk_hash = blake3::guts::ChunkState::new(index)
+                    .update(&self.buf[..self.buf_end])
+                    .finalize(finalization.is_root());
+                self.state.feed_chunk(&chunk_hash)?;
+                self.buf_start = 0;
+                false
+            }
+            NextRead::Done => true, // The seek is done.
+        }))
+    }
+
+    fn poll_fill_buffer_from_input(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        let mut buf = ReadBuf::new(&mut self.buf[..self.buf_end]);
+        buf.advance(self.buf_start);
+        let src = &mut self.input;
+        while buf.remaining() > 0 {
+            ready!(AsyncRead::poll_read(Pin::new(src), cx, &mut buf))?;
+            self.buf_start = buf.filled().len();
+        }
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_fill_buffer_from_outboard(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        let mut buf = ReadBuf::new(&mut self.buf[..self.buf_end]);
+        buf.advance(self.buf_start);
+        let src = self.outboard.as_mut().unwrap();
+        while buf.remaining() > 0 {
+            ready!(AsyncRead::poll_read(Pin::new(src), cx, &mut buf))?;
+            self.buf_start = buf.filled().len();
+        }
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_fill_buffer_from_input_or_outboard(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        if self.outboard.is_some() {
+            self.poll_fill_buffer_from_outboard(cx)
+        } else {
+            self.poll_fill_buffer_from_input(cx)
+        }
+    }
+}
+
+impl<T, O> fmt::Debug for DecoderShared<T, O> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
@@ -629,7 +812,7 @@ fn add_offset(position: u64, offset: i64) -> io::Result<u64> {
 /// # Ok(())
 /// # }
 /// ```
-pub struct SliceDecoder<T: Read> {
+pub struct SliceDecoder<T> {
     shared: DecoderShared<T, T>,
     slice_start: u64,
     slice_remaining: u64,
@@ -721,12 +904,19 @@ pub(crate) fn make_test_input(len: usize) -> Vec<u8> {
 mod test {
     use rand::prelude::*;
     use rand_chacha::ChaChaRng;
+    use tokio::io::AsyncRead;
+    use tokio::io::ReadBuf;
+    use std::convert::TryInto;
     use std::io;
     use std::io::prelude::*;
     use std::io::Cursor;
+    use std::pin::Pin;
+    use std::task::Context;
+    use std::task::Poll;
 
     use super::*;
     use crate::encode;
+    use crate::encode::ParseState;
 
     #[test]
     fn test_decode() {
@@ -861,7 +1051,7 @@ mod test {
         let mut output = Vec::new();
         let mut decoder = Decoder::new(&*zero_encoded, &zero_hash);
         decoder.read_to_end(&mut output).unwrap();
-        assert_eq!(&output, &[]);
+        assert_eq!(output.len(), 0);
 
         // Decoding the empty tree with any other hash should fail.
         let mut output = Vec::new();
@@ -936,7 +1126,7 @@ mod test {
             let mut decoder = Decoder::new(Cursor::new(&encoded), &hash);
             decoder.seek(SeekFrom::Start(case as u64)).unwrap();
             decoder.read_to_end(&mut output).unwrap();
-            assert_eq!(&output, &[]);
+            assert_eq!(output.len(), 0);
 
             // Seeking to EOF should fail if the root hash is wrong.
             let mut bad_hash_bytes = *hash.as_bytes();
@@ -1093,5 +1283,167 @@ mod test {
         let outboard_decoder = Decoder::new_outboard(&b""[..], &b""[..], &hash);
         let (_, outboard_reader) = outboard_decoder.into_inner();
         assert!(outboard_reader.is_some());
+    }
+
+    fn print_bao_encoded(input: &[u8]) {
+        if input.len() < 8 {
+            println!("too short");
+            return;
+        }
+        let mut state = ParseState::new();
+        let mut remaining = input;
+        loop {
+            match state.read_next() {
+                NextRead::Header => {
+                    let header: &[u8; 8] = &remaining[..8].try_into().unwrap();
+                    let len = u64::from_le_bytes(*header);
+                    println!("header  {} {}", hex::encode(header), len);
+                    println!();
+                    state.feed_header(header);
+                    remaining = &remaining[8..];
+                }
+                NextRead::Chunk { index, size, skip, finalization } => {
+                    let data = &remaining[..size];
+                    println!("data index={} size={} skip={} finalization={:?}", index, size, skip, finalization);
+                    for chunk in data.chunks(32) {
+                        println!("{}", hex::encode(chunk));
+                    }
+                    println!();
+                    state.advance_chunk();
+                    remaining = &remaining[size..];
+                }
+                NextRead::Parent => {
+                    let parent: &[u8; 64] = remaining[..64].try_into().unwrap();
+                    println!("parent");
+                    println!("{}", hex::encode(&parent[..32]));
+                    println!("{}", hex::encode(&parent[32..]));
+                    println!();
+                    state.advance_parent();
+                    remaining = &remaining[64..];
+                }
+                NextRead::Done => {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn validate_bao_encoded(hash: blake3::Hash, input: &[u8]) -> Result<(), Error> {
+        let mut validator = VerifyState::new(&hash);
+        let mut remaining = input;
+        loop {
+            match validator.read_next() {
+                NextRead::Header => {
+                    let header: &[u8; 8] = &remaining[..8].try_into().unwrap();
+                    validator.feed_header(header);
+                    remaining = &remaining[8..];
+                }
+                NextRead::Parent => {
+                    let parent: &[u8; 64] = remaining[..64].try_into().unwrap();
+                    validator.feed_parent(parent)?;
+                    remaining = &remaining[64..];
+                }
+                NextRead::Chunk { index, size, skip, finalization } => {
+                    let chunk = &remaining[..size];
+                    let chunk_hash = blake3::guts::ChunkState::new(index)
+                        .update(chunk)
+                        .finalize(finalization.is_root());
+                    validator.feed_chunk(&chunk_hash)?;
+                    remaining = &remaining[size..];
+                }
+                NextRead::Done => {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct AsyncDecoder<T: AsyncRead + Unpin, O: AsyncRead + Unpin> {
+        shared: DecoderShared<T, O>,
+    }
+
+    impl<T: AsyncRead + Unpin> AsyncDecoder<T, T> {
+        pub fn new(inner: T, hash: &Hash) -> Self {
+            Self {
+                shared: DecoderShared::new(inner, None, hash),
+            }
+        }
+    }
+
+    impl<T: AsyncRead + Unpin, O: AsyncRead + Unpin> AsyncDecoder<T, O> {
+
+        pub fn new_outboard(inner: T, outboard: O, hash: &Hash) -> Self {
+            Self {
+                shared: DecoderShared::new(inner, Some(outboard), hash),
+            }
+        }
+
+        /// Return the underlying reader and the outboard reader, if any. If the `Decoder` was created
+        /// with `Decoder::new`, the outboard reader will be `None`.
+        pub fn into_inner(self) -> (T, Option<O>) {
+            (self.shared.input, self.shared.outboard)
+        }
+    }
+
+    impl<T: AsyncRead + Unpin, O: AsyncRead + Unpin> AsyncRead for AsyncDecoder<T, O> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            self.shared.poll_read(cx, buf)
+        }
+    }
+
+    #[test]
+    fn test_print_bao_encoded() {
+        for &case in crate::test::TEST_CASES {
+            println!("case {}", case);
+            let input = make_test_input(case);
+            let encoded = encode::encode(input).0;
+            print_bao_encoded(&encoded);
+        }
+    }
+
+    #[test]
+    fn test_validate_bao_encoded() {
+        for &case in crate::test::TEST_CASES {
+            println!("case {}", case);
+            let input = make_test_input(case);
+            let (encoded, hash) = encode::encode(&input);
+            validate_bao_encoded(hash, &encoded).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_async_decode() {
+        for &case in crate::test::TEST_CASES {
+            use tokio::io::AsyncReadExt;
+            println!("case {}", case);
+            let input = make_test_input(case);
+            let (encoded, hash) = { encode::encode(&input) };
+            let mut output = Vec::new();
+            let mut reader = AsyncDecoder::new(&encoded[..], &hash);
+            reader.read_to_end(&mut output).await.unwrap();
+            let output = decode(encoded, &hash).unwrap();
+            assert_eq!(input, output);
+            assert_eq!(output.len(), output.capacity());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_async_decode_outboard() {
+        for &case in &crate::test::TEST_CASES[1..] {
+            use tokio::io::AsyncReadExt;
+            println!("case {}", case);
+            let input = make_test_input(case);
+            let (outboard, hash) = { encode::outboard(&input) };
+            let mut output = Vec::new();
+            let mut reader = AsyncDecoder::new_outboard(&input[..], &outboard[..], &hash);
+            reader.read_to_end(&mut output).await.unwrap();
+            assert_eq!(input, output);
+        }
     }
 }
