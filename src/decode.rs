@@ -831,10 +831,6 @@ mod tokio_io {
         }
     }
 
-    fn io_err(text: &str) -> io::Error {
-        io::Error::new(io::ErrorKind::Other, text)
-    }
-
     impl<
             T: AsyncRead + AsyncSeek + Unpin + 'static,
             O: AsyncRead + AsyncSeek + Unpin + 'static,
@@ -862,7 +858,9 @@ mod tokio_io {
                     self.0 = DecoderState::Seeking(fut);
                     Ok(())
                 }
-                DecoderState::Seeking(_) => Err(io_err("already seeking")),
+                DecoderState::Seeking(_) => {
+                    Err(io::Error::new(io::ErrorKind::Other, "already seeking"))
+                }
                 DecoderState::Invalid => {
                     unreachable!()
                 }
