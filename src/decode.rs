@@ -690,7 +690,10 @@ mod tokio_io {
         ///
         /// note that even when passing i SeekFrom::Current, the actual seek is done from
         /// the start of the file. So we don't have to worry about the internal state.
-        async fn seek_fut(self: Pin<Box<Self>>, pos: SeekFrom) -> (Pin<Box<Self>>, io::Result<u64>) {
+        async fn seek_fut(
+            self: Pin<Box<Self>>,
+            pos: SeekFrom,
+        ) -> (Pin<Box<Self>>, io::Result<u64>) {
             let mut this = self;
             let result = this.seek_fut_inner(pos).await;
             (this, result)
@@ -743,6 +746,9 @@ mod tokio_io {
     /// future that contains the seek state machine
     type SeekFut<T, O> = Pin<Box<dyn Future<Output = (BoxedDecoderShared<T, O>, io::Result<u64>)>>>;
 
+    /// state of the decoder
+    ///
+    /// this is a separate type so it can be private
     enum DecoderState<T: AsyncRead + Unpin, O: AsyncRead + Unpin> {
         /// we are reading from the underlying reader
         Reading(BoxedDecoderShared<T, O>),
@@ -757,6 +763,65 @@ mod tokio_io {
     impl<T: AsyncRead + Unpin, O: AsyncRead + Unpin> DecoderState<T, O> {
         fn take(&mut self) -> Self {
             std::mem::replace(self, DecoderState::Invalid)
+        }
+
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            // on a zero length read, we do nothing whatsoever
+            if buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+
+            loop {
+                match self.take() {
+                    Self::Reading(mut shared) => {
+                        match shared.poll_input(cx) {
+                            Poll::Ready(Ok(())) => {
+                                // we have read a chunk from the underlying reader
+                                // go to output state
+                                *self = Self::Output(shared);
+                                continue;
+                            }
+                            Poll::Ready(Err(e)) => {
+                                // we got an error from the underlying io
+                                // stay in reading state
+                                *self = Self::Reading(shared);
+                                break Poll::Ready(Err(e));
+                            }
+                            Poll::Pending => {
+                                // we don't have a complete chunk yet
+                                // stay in reading state
+                                *self = Self::Output(shared);
+                                break Poll::Pending;
+                            }
+                        }
+                    }
+                    Self::Output(mut shared) => {
+                        shared.write_output(buf);
+                        *self = if shared.buf_len() == 0 {
+                            // the caller has consumed all the data in the buffer
+                            // go to reading state
+                            shared.clear_buf();
+                            Self::Reading(shared)
+                        } else {
+                            // we still have data in the buffer
+                            // stay in output state
+                            Self::Output(shared)
+                        };
+                        break Poll::Ready(Ok(()));
+                    }
+                    Self::Seeking(shared) => {
+                        *self = Self::Seeking(shared);
+                        break Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "seeking")));
+                    }
+                    DecoderState::Invalid => {
+                        break Poll::Ready(Ok(()));
+                    }
+                }
+            }
         }
     }
 
@@ -782,57 +847,7 @@ mod tokio_io {
             cx: &mut Context<'_>,
             buf: &mut ReadBuf<'_>,
         ) -> Poll<io::Result<()>> {
-            // on a zero length read, we do nothing whatsoever
-            if buf.remaining() == 0 {
-                return Poll::Ready(Ok(()));
-            }
-
-            loop {
-                match self.0.take() {
-                    DecoderState::Reading(mut shared) => {
-                        match shared.poll_input(cx) {
-                            Poll::Ready(Ok(())) => {
-                                // we have read a chunk from the underlying reader
-                                // go to output state
-                                self.0 = DecoderState::Output(shared);
-                                continue;
-                            }
-                            Poll::Ready(Err(e)) => {
-                                // we got an error from the underlying io
-                                // stay in reading state
-                                self.0 = DecoderState::Reading(shared);
-                                break Poll::Ready(Err(e));
-                            }
-                            Poll::Pending => {
-                                // we don't have a complete chunk yet
-                                // stay in reading state
-                                self.0 = DecoderState::Output(shared);
-                                break Poll::Pending;
-                            }
-                        }
-                    }
-                    DecoderState::Output(mut shared) => {
-                        shared.write_output(buf);
-                        if shared.buf_len() == 0 {
-                            // the caller has consumed all the data in the buffer
-                            // go to reading state
-                            shared.clear_buf();
-                            self.0 = DecoderState::Reading(shared);
-                        } else {
-                            // we still have data in the buffer
-                            // stay in output state
-                            self.0 = DecoderState::Output(shared);
-                        };
-                        break Poll::Ready(Ok(()));
-                    }
-                    DecoderState::Seeking(_) => {
-                        break Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "seeking")))
-                    }
-                    DecoderState::Invalid => {
-                        break Poll::Ready(Ok(()));
-                    }
-                }
-            }
+            Pin::new(&mut self.0).poll_read(cx, buf)
         }
     }
 

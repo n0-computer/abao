@@ -1193,6 +1193,234 @@ pub(crate) fn cast_offset(offset: u128) -> io::Result<u64> {
     }
 }
 
+#[cfg(feature = "tokio_io")]
+mod tokio_io {
+    use std::{
+        cmp,
+        pin::Pin,
+        task::{ready, Poll},
+    };
+
+    use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite};
+
+    use crate::CHUNK_SIZE;
+
+    use super::State;
+
+    struct EncoderShared<T> {
+        inner: T,
+        chunk_state: blake3::guts::ChunkState,
+        tree_state: State,
+        outboard: bool,
+        finalized: bool,
+    }
+
+    /// type alias to make clippy happy
+    type BoxedEncoderShared<T> = Pin<Box<EncoderShared<T>>>;
+
+    enum AsyncEncoderState<T> {
+        WritingHashes {
+            state: BoxedEncoderShared<T>,
+            // buffer for writing out hashes
+            buf: [u8; 64],
+            // start of the buffer. 0 to 64
+            buf_start: usize,
+        },
+        Writing(BoxedEncoderShared<T>),
+        Finalized,
+    }
+
+    impl<T> AsyncEncoderState<T> {
+        fn take(&mut self) -> Self {
+            std::mem::replace(self, AsyncEncoderState::Finalized)
+        }
+    }
+
+    pub struct AsyncEncoder<T>(AsyncEncoderState<T>);
+
+    impl<T: AsyncRead + AsyncWrite + AsyncSeek + Unpin + 'static> EncoderShared<T> {}
+
+    impl<T: AsyncRead + AsyncWrite + AsyncSeek + Unpin + 'static> AsyncWrite for AsyncEncoder<T> {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            input: &[u8],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            // Short-circuit if the input is empty.
+            if input.is_empty() {
+                return Poll::Ready(Ok(0));
+            }
+
+            loop {
+                match self.0.take() {
+                    AsyncEncoderState::Writing(mut state) => {
+                        // Add as many bytes as possible to the current chunk.
+                        let want = CHUNK_SIZE - state.chunk_state.len();
+                        let written = if !state.outboard {
+                            // we are not in outboard state, so we have to pass through the write
+                            // to the inner writer.
+                            let take = cmp::min(want, input.len());
+                            let res = Pin::new(&mut state.inner).poll_write(cx, &input[..take]);
+                            match res {
+                                Poll::Pending => {
+                                    // still writing
+                                    self.0 = AsyncEncoderState::Writing(state);
+                                    return Poll::Pending;
+                                }
+                                Poll::Ready(Err(e)) => {
+                                    // still writing
+                                    self.0 = AsyncEncoderState::Writing(state);
+                                    return Poll::Ready(Err(e));
+                                }
+                                Poll::Ready(Ok(written)) => written,
+                            }
+                        } else {
+                            // we are in outboard state, so we can just pretend the write succeeded
+                            want
+                        };
+                        // update the chunk state
+                        state.chunk_state.update(&input[..written]);
+                        if state.chunk_state.len() == CHUNK_SIZE {
+                            // got a whole chunk, so we can hash it
+                            let chunk_hash = state.chunk_state.finalize(false);
+                            state.tree_state.push_subtree(&chunk_hash, CHUNK_SIZE);
+                            // init chunk state for next chunk
+                            let chunk_counter = state.tree_state.count() / CHUNK_SIZE as u64;
+                            state.chunk_state = blake3::guts::ChunkState::new(chunk_counter);
+                            // go into hashing state
+                            self.0 = AsyncEncoderState::WritingHashes {
+                                state,
+                                buf: [0; 64],
+                                buf_start: 64,
+                            };
+                        } else {
+                            // still writing
+                            self.0 = AsyncEncoderState::Writing(state);
+                        }
+                        return Poll::Ready(Ok(written));
+                    }
+                    AsyncEncoderState::WritingHashes {
+                        mut state,
+                        buf,
+                        mut buf_start,
+                    } => {
+                        while buf_start < buf.len() {
+                            // try to write as much as possible from our hash buffer
+                            let res = Pin::new(&mut state.inner).poll_write(cx, &buf[buf_start..]);
+                            match res {
+                                Poll::Pending => {
+                                    // still writing
+                                    self.0 = AsyncEncoderState::WritingHashes {
+                                        state,
+                                        buf,
+                                        buf_start,
+                                    };
+                                    return Poll::Pending;
+                                }
+                                Poll::Ready(Err(e)) => {
+                                    // still writing
+                                    self.0 = AsyncEncoderState::WritingHashes {
+                                        state,
+                                        buf,
+                                        buf_start,
+                                    };
+                                    return Poll::Ready(Err(e));
+                                }
+                                Poll::Ready(Ok(written)) => {
+                                    buf_start += written;
+                                }
+                            };
+                        }
+                        // if we get here, we have written the current hash buffer
+                        if let Some(parent) = state.tree_state.merge_parent() {
+                            // we have a parent to write
+                            self.0 = AsyncEncoderState::WritingHashes {
+                                state,
+                                buf: parent,
+                                buf_start: 0,
+                            };
+                        } else {
+                            // we are done writing hashes
+                            self.0 = AsyncEncoderState::Writing(state);
+                        }
+                    }
+                    AsyncEncoderState::Finalized => {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "already finalized",
+                        )))
+                    }
+                }
+            }
+
+            // // If the current chunk is full, we need to finalize it, add it to
+            // // the tree state, and write out any completed parent nodes.
+            // if self.chunk_state.len() == CHUNK_SIZE {
+            //     // This can't be the root, because we know more input is coming.
+            //     let chunk_hash = self.chunk_state.finalize(false);
+            //     self.tree_state.push_subtree(&chunk_hash, CHUNK_SIZE);
+            //     let chunk_counter = self.tree_state.count() / CHUNK_SIZE as u64;
+            //     self.chunk_state = blake3::guts::ChunkState::new(chunk_counter);
+            //     // go into hash writing mode
+            //     while let Some(parent) = self.tree_state.merge_parent() {
+            //         self.buf = parent;
+            //         self.buf_start = 0;
+            //         // self.inner.write_all(&parent)?;
+            //     }
+            // }
+
+            // // Add as many bytes as possible to the current chunk.
+            // let want = CHUNK_SIZE - self.chunk_state.len();
+            // let written = if !self.outboard {
+            //     // we are not in outboard state, so we have to pass through the write
+            //     // to the inner writer.
+            //     let take = cmp::min(want, input.len());
+            //     ready!(Pin::new(&mut self.inner).poll_write(cx, &input[..take]))?
+            // } else {
+            //     // we are in outboard state, so we can just pretend the write succeeded
+            //     want
+            // };
+            // // update the chunk state
+            // self.chunk_state.update(&input[..written]);
+            // Poll::Ready(Ok(written))
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), std::io::Error>> {
+            match &mut self.0 {
+                AsyncEncoderState::Writing(state) => {
+                    ready!(Pin::new(&mut state.inner).poll_flush(cx))?;
+                }
+                AsyncEncoderState::WritingHashes { state, .. } => {
+                    // todo: flush the buf
+                    ready!(Pin::new(&mut state.inner).poll_flush(cx))?;
+                }
+                AsyncEncoderState::Finalized => {}
+            };
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), std::io::Error>> {
+            match &mut self.0 {
+                AsyncEncoderState::Writing(state) => {
+                    ready!(Pin::new(&mut state.inner).poll_shutdown(cx))?;
+                }
+                AsyncEncoderState::WritingHashes { state, .. } => {
+                    // todo: flush the buf (should flush before shutdown)
+                    ready!(Pin::new(&mut state.inner).poll_shutdown(cx))?;
+                }
+                AsyncEncoderState::Finalized => {}
+            };
+            Poll::Ready(Ok(()))
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
