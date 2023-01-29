@@ -468,7 +468,6 @@ mod tokio_io {
         future::{poll_fn, Future},
         io::{self, SeekFrom},
         pin::Pin,
-        process::Output,
         task::{ready, Context, Poll},
     };
     use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt, ReadBuf};
@@ -687,6 +686,10 @@ mod tokio_io {
             poll_fn(move |cx| self.poll_handle_seek_read(next, cx))
         }
 
+        /// seek as a future
+        ///
+        /// note that even when passing i SeekFrom::Current, the actual seek is done from
+        /// the start of the file. So we don't have to worry about the internal state.
         async fn seek_fut(self: Box<Self>, pos: SeekFrom) -> (Box<Self>, io::Result<u64>) {
             let mut this = self;
             let result = this.seek_fut_inner(pos).await;
@@ -841,11 +844,17 @@ mod tokio_io {
             let state = self.0.take();
             match state {
                 DecoderState::Reading(shared) => {
+                    if shared.buf_len() > 0 {
+                        // todo if the seek is SeekFrom::Current, tweak position
+                    }
                     let fut = Box::pin(shared.seek_fut(position));
                     self.0 = DecoderState::Seeking(fut);
                     Ok(())
                 }
                 DecoderState::Output(shared) => {
+                    if shared.buf_len() > 0 {
+                        // todo if the seek is SeekFrom::Current, tweak position
+                    }
                     let fut = Box::pin(shared.seek_fut(position));
                     self.0 = DecoderState::Seeking(fut);
                     Ok(())
@@ -860,8 +869,30 @@ mod tokio_io {
         fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
             let state = self.0.take();
             match state {
-                DecoderState::Reading(_) => Poll::Ready(Err(io_err("not seeking"))),
-                DecoderState::Output(_) => Poll::Ready(Err(io_err("not seeking"))),
+                DecoderState::Reading(state) => {
+                    // it is recommended to call poll_complete before calling start_seek,
+                    // just to make sure there is no other seek in progress.
+                    // so we must handle this.
+                    //
+                    // we are in the process of reading a chunk from the underlying reader,
+                    // but the outside has not seen that data. So the content of the buffer
+                    // is not relevant, and we just return the current position.
+                    let current = state.state.content_position();
+                    self.0 = DecoderState::Reading(state);
+                    Poll::Ready(Ok(current))
+                }
+                DecoderState::Output(state) => {
+                    // it is recommended to call poll_complete before calling start_seek,
+                    // just to make sure there is no other seek in progress.
+                    // so we must handle this.
+                    //
+                    // we are in the process of outputting a chunk to the 
+                    // we have to subtract the length of the buffer (that the caller has not seen yet)
+                    // from the internal current position.
+                    let current = state.adjusted_content_position();
+                    self.0 = DecoderState::Output(state);
+                    Poll::Ready(Ok(current))
+                }
                 DecoderState::Seeking(mut fut) => {
                     let res = Pin::new(&mut fut).poll(cx);
                     match res {
@@ -1031,7 +1062,7 @@ mod tokio_io {
         use super::*;
         use crate::{
             decode::{make_test_input, SliceDecoder},
-            encode, CHUNK_SIZE, HEADER_SIZE,
+            encode, CHUNK_SIZE, HEADER_SIZE, PARENT_SIZE,
         };
 
         #[tokio::test]
@@ -1059,6 +1090,131 @@ mod tokio_io {
                 let mut reader = AsyncDecoder::new_outboard(&input[..], &outboard[..], &hash);
                 reader.read_to_end(&mut output).await.unwrap();
                 assert_eq!(input, output);
+            }
+        }
+
+        #[tokio::test]
+        async fn test_async_seek() {
+            for &input_len in crate::test::TEST_CASES {
+                println!();
+                println!("input_len {}", input_len);
+                let input = make_test_input(input_len);
+                let (encoded, hash) = encode::encode(&input);
+                for &seek in crate::test::TEST_CASES {
+                    println!("seek {}", seek);
+                    // Test all three types of seeking.
+                    let mut seek_froms = Vec::new();
+                    seek_froms.push(SeekFrom::Start(seek as u64));
+                    seek_froms.push(SeekFrom::End(seek as i64 - input_len as i64));
+                    seek_froms.push(SeekFrom::Current(seek as i64));
+                    for seek_from in seek_froms {
+                        println!("seek_from {:?}", seek_from);
+                        let mut decoder = AsyncDecoder::new(Cursor::new(encoded.clone()), &hash);
+                        let mut output = Vec::new();
+                        decoder.seek(seek_from).await.expect("seek error");
+                        decoder
+                            .read_to_end(&mut output)
+                            .await
+                            .expect("decoder error");
+                        let input_start = cmp::min(seek, input.len());
+                        assert_eq!(
+                            &input[input_start..],
+                            &output[..],
+                            "output doesn't match input"
+                        );
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn test_async_seeking_around_invalid_data() {
+            for &case in crate::test::TEST_CASES {
+                // Skip the cases with only one or two chunks, so we have valid
+                // reads before and after the tweak.
+                if case <= 2 * CHUNK_SIZE {
+                    continue;
+                }
+
+                println!("\ncase {}", case);
+                let input = make_test_input(case);
+                let (mut encoded, hash) = encode::encode(&input);
+                println!("encoded len {}", encoded.len());
+
+                // Tweak a bit at the start of a chunk about halfway through. Loop
+                // over prior parent nodes and chunks to figure out where the
+                // target chunk actually starts.
+                let tweak_chunk = encode::count_chunks(case as u64) / 2;
+                let tweak_position = tweak_chunk as usize * CHUNK_SIZE;
+                println!("tweak position {}", tweak_position);
+                let mut tweak_encoded_offset = HEADER_SIZE;
+                for chunk in 0..tweak_chunk {
+                    tweak_encoded_offset +=
+                        encode::pre_order_parent_nodes(chunk, case as u64) as usize * PARENT_SIZE;
+                    tweak_encoded_offset += CHUNK_SIZE;
+                }
+                tweak_encoded_offset +=
+                    encode::pre_order_parent_nodes(tweak_chunk, case as u64) as usize * PARENT_SIZE;
+                println!("tweak encoded offset {}", tweak_encoded_offset);
+                encoded[tweak_encoded_offset] ^= 1;
+
+                // Read all the bits up to that tweak. Because it's right after a chunk boundary, the
+                // read should succeed.
+                let mut decoder = AsyncDecoder::new(Cursor::new(encoded.clone()), &hash);
+                let mut output = vec![0; tweak_position as usize];
+                decoder.read_exact(&mut output).await.unwrap();
+                assert_eq!(&input[..tweak_position], &*output);
+
+                // Further reads at this point should fail.
+                let mut buf = [0; CHUNK_SIZE];
+                let res = decoder.read(&mut buf).await;
+                assert_eq!(res.unwrap_err().kind(), io::ErrorKind::InvalidData);
+
+                // But now if we seek past the bad chunk, things should succeed again.
+                let new_start = tweak_position + CHUNK_SIZE;
+                decoder
+                    .seek(SeekFrom::Start(new_start as u64))
+                    .await
+                    .unwrap();
+                let mut output = Vec::new();
+                decoder.read_to_end(&mut output).await.unwrap();
+                assert_eq!(&input[new_start..], &*output);
+            }
+        }
+
+        #[tokio::test]
+        async fn test_async_invalid_eof_seek() {
+            // The decoder must validate the final chunk as part of seeking to or
+            // past EOF.
+            for &case in crate::test::TEST_CASES {
+                let input = make_test_input(case);
+                let (encoded, hash) = encode::encode(&input);
+
+                // Seeking to EOF should succeed with the right hash.
+                let mut output = Vec::new();
+                let mut decoder = AsyncDecoder::new(Cursor::new(encoded.clone()), &hash);
+                decoder.seek(SeekFrom::Start(case as u64)).await.unwrap();
+                decoder.read_to_end(&mut output).await.unwrap();
+                assert_eq!(output.len(), 0);
+
+                // Seeking to EOF should fail if the root hash is wrong.
+                let mut bad_hash_bytes = *hash.as_bytes();
+                bad_hash_bytes[0] ^= 1;
+                let bad_hash = bad_hash_bytes.into();
+                let mut decoder = AsyncDecoder::new(Cursor::new(encoded.clone()), &bad_hash);
+                let result = decoder.seek(SeekFrom::Start(case as u64)).await;
+                assert!(result.is_err(), "a bad hash is supposed to fail!");
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+
+                // It should also fail if the final chunk has been corrupted.
+                if case > 0 {
+                    let mut bad_encoded = encoded.clone();
+                    *bad_encoded.last_mut().unwrap() ^= 1;
+                    let mut decoder = AsyncDecoder::new(Cursor::new(bad_encoded.clone()), &hash);
+                    let result = decoder.seek(SeekFrom::Start(case as u64)).await;
+                    assert!(result.is_err(), "a bad hash is supposed to fail!");
+                    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+                }
             }
         }
 
