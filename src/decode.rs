@@ -690,7 +690,7 @@ mod tokio_io {
         ///
         /// note that even when passing i SeekFrom::Current, the actual seek is done from
         /// the start of the file. So we don't have to worry about the internal state.
-        async fn seek_fut(self: Box<Self>, pos: SeekFrom) -> (Box<Self>, io::Result<u64>) {
+        async fn seek_fut(self: Pin<Box<Self>>, pos: SeekFrom) -> (Pin<Box<Self>>, io::Result<u64>) {
             let mut this = self;
             let result = this.seek_fut_inner(pos).await;
             (this, result)
@@ -738,13 +738,18 @@ mod tokio_io {
         }
     }
 
+    /// type alias to make clippy happy
+    type BoxedDecoderShared<T, O> = Pin<Box<DecoderShared<T, O>>>;
+    /// future that contains the seek state machine
+    type SeekFut<T, O> = Pin<Box<dyn Future<Output = (BoxedDecoderShared<T, O>, io::Result<u64>)>>>;
+
     enum DecoderState<T: AsyncRead + Unpin, O: AsyncRead + Unpin> {
         /// we are reading from the underlying reader
-        Reading(Box<DecoderShared<T, O>>),
+        Reading(BoxedDecoderShared<T, O>),
         /// we are being polled for output
-        Output(Box<DecoderShared<T, O>>),
+        Output(BoxedDecoderShared<T, O>),
         /// we are currently seeking
-        Seeking(Pin<Box<dyn Future<Output = (Box<DecoderShared<T, O>>, io::Result<u64>)>>>),
+        Seeking(SeekFut<T, O>),
         /// invalid state
         Invalid,
     }
@@ -760,14 +765,14 @@ mod tokio_io {
     impl<T: AsyncRead + Unpin> AsyncDecoder<T, T> {
         pub fn new(inner: T, hash: &Hash) -> Self {
             let state = DecoderShared::new(inner, None, hash);
-            Self(DecoderState::Reading(Box::new(state)))
+            Self(DecoderState::Reading(Box::pin(state)))
         }
     }
 
     impl<T: AsyncRead + Unpin, O: AsyncRead + Unpin> AsyncDecoder<T, O> {
         pub fn new_outboard(inner: T, outboard: O, hash: &Hash) -> Self {
             let state = DecoderShared::new(inner, Some(outboard), hash);
-            Self(DecoderState::Reading(Box::new(state)))
+            Self(DecoderState::Reading(Box::pin(state)))
         }
     }
 
