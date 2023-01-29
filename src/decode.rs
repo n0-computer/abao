@@ -844,18 +844,21 @@ mod tokio_io {
             let state = self.0.take();
             match state {
                 DecoderState::Reading(shared) => {
-                    if shared.buf_len() > 0 {
-                        // todo if the seek is SeekFrom::Current, tweak position
-                    }
+                    // we are in the process of filling the buffer, but nobody has seen that data.
+                    // so we can just ignore it. It will be cleared immediately in seek_fut.
                     let fut = Box::pin(shared.seek_fut(position));
                     self.0 = DecoderState::Seeking(fut);
                     Ok(())
                 }
                 DecoderState::Output(shared) => {
-                    if shared.buf_len() > 0 {
-                        // todo if the seek is SeekFrom::Current, tweak position
-                    }
-                    let fut = Box::pin(shared.seek_fut(position));
+                    let inner = if let SeekFrom::Current(current) = position {
+                        // we are in the process of outputting data to the caller, but the internal
+                        // state is already at the end of the chunk. So we must adjust the position
+                        SeekFrom::Current(current + shared.buf_len() as i64)
+                    } else {
+                        position
+                    };
+                    let fut = Box::pin(shared.seek_fut(inner));
                     self.0 = DecoderState::Seeking(fut);
                     Ok(())
                 }
@@ -886,7 +889,7 @@ mod tokio_io {
                     // just to make sure there is no other seek in progress.
                     // so we must handle this.
                     //
-                    // we are in the process of outputting a chunk to the 
+                    // we are in the process of outputting a chunk to the underlying reader,
                     // we have to subtract the length of the buffer (that the caller has not seen yet)
                     // from the internal current position.
                     let current = state.adjusted_content_position();
