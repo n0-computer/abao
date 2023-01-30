@@ -1197,36 +1197,48 @@ pub(crate) fn cast_offset(offset: u128) -> io::Result<u64> {
 mod tokio_io {
     use std::{
         cmp,
+        io::{self, SeekFrom},
         pin::Pin,
         task::{ready, Poll},
     };
 
-    use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 
-    use crate::CHUNK_SIZE;
+    use crate::{encode::StateFinish, CHUNK_SIZE, HASH_SIZE, HEADER_SIZE, PARENT_SIZE};
 
-    use super::State;
+    use super::{FlipperNext, FlipperState, State};
 
     struct EncoderShared<T> {
         inner: T,
         chunk_state: blake3::guts::ChunkState,
         tree_state: State,
         outboard: bool,
-        finalized: bool,
+    }
+
+    impl<T> EncoderShared<T> {
+        fn new(inner: T, outboard: bool) -> Self {
+            Self {
+                inner,
+                chunk_state: blake3::guts::ChunkState::new(0),
+                tree_state: State::new(),
+                outboard,
+            }
+        }
     }
 
     /// type alias to make clippy happy
     type BoxedEncoderShared<T> = Pin<Box<EncoderShared<T>>>;
 
     enum AsyncEncoderState<T> {
+        WritingData(BoxedEncoderShared<T>),
+        HashingChunk(BoxedEncoderShared<T>),
         WritingHashes {
             state: BoxedEncoderShared<T>,
             // buffer for writing out hashes
-            buf: [u8; 64],
+            buf: [u8; 2 * HASH_SIZE],
             // start of the buffer. 0 to 64
             buf_start: usize,
         },
-        Writing(BoxedEncoderShared<T>),
         Finalized,
     }
 
@@ -1236,11 +1248,7 @@ mod tokio_io {
         }
     }
 
-    pub struct AsyncEncoder<T>(AsyncEncoderState<T>);
-
-    impl<T: AsyncRead + AsyncWrite + AsyncSeek + Unpin + 'static> EncoderShared<T> {}
-
-    impl<T: AsyncRead + AsyncWrite + AsyncSeek + Unpin + 'static> AsyncWrite for AsyncEncoder<T> {
+    impl<T: AsyncRead + AsyncWrite + AsyncSeek + Unpin> AsyncEncoderState<T> {
         fn poll_write(
             mut self: std::pin::Pin<&mut Self>,
             cx: &mut std::task::Context<'_>,
@@ -1252,54 +1260,53 @@ mod tokio_io {
             }
 
             loop {
-                match self.0.take() {
-                    AsyncEncoderState::Writing(mut state) => {
+                match self.take() {
+                    Self::WritingData(mut state) => {
                         // Add as many bytes as possible to the current chunk.
                         let want = CHUNK_SIZE - state.chunk_state.len();
-                        let written = if !state.outboard {
+                        let res = if !state.outboard {
                             // we are not in outboard state, so we have to pass through the write
                             // to the inner writer.
                             let take = cmp::min(want, input.len());
-                            let res = Pin::new(&mut state.inner).poll_write(cx, &input[..take]);
-                            match res {
-                                Poll::Pending => {
-                                    // still writing
-                                    self.0 = AsyncEncoderState::Writing(state);
-                                    return Poll::Pending;
-                                }
-                                Poll::Ready(Err(e)) => {
-                                    // still writing
-                                    self.0 = AsyncEncoderState::Writing(state);
-                                    return Poll::Ready(Err(e));
-                                }
-                                Poll::Ready(Ok(written)) => written,
+                            Pin::new(&mut state.inner).poll_write(cx, &input[..take])
+                        } else {
+                            // we are in outboard mode, so there is nothing to write
+                            Poll::Ready(Ok(want))
+                        };
+
+                        // add input and figure out next state
+                        *self = if let Poll::Ready(Ok(written)) = &res {
+                            // update the chunk state
+                            state.chunk_state.update(&input[..*written]);
+                            if state.chunk_state.len() == CHUNK_SIZE {
+                                Self::HashingChunk(state)
+                            } else {
+                                Self::WritingData(state)
                             }
                         } else {
-                            // we are in outboard state, so we can just pretend the write succeeded
-                            want
-                        };
-                        // update the chunk state
-                        state.chunk_state.update(&input[..written]);
-                        if state.chunk_state.len() == CHUNK_SIZE {
-                            // got a whole chunk, so we can hash it
-                            let chunk_hash = state.chunk_state.finalize(false);
-                            state.tree_state.push_subtree(&chunk_hash, CHUNK_SIZE);
-                            // init chunk state for next chunk
-                            let chunk_counter = state.tree_state.count() / CHUNK_SIZE as u64;
-                            state.chunk_state = blake3::guts::ChunkState::new(chunk_counter);
-                            // go into hashing state
-                            self.0 = AsyncEncoderState::WritingHashes {
-                                state,
-                                buf: [0; 64],
-                                buf_start: 64,
-                            };
-                        } else {
                             // still writing
-                            self.0 = AsyncEncoderState::Writing(state);
-                        }
-                        return Poll::Ready(Ok(written));
+                            Self::WritingData(state)
+                        };
+                        return res;
                     }
-                    AsyncEncoderState::WritingHashes {
+                    Self::HashingChunk(mut state) => {
+                        debug_assert!(state.chunk_state.len() == CHUNK_SIZE);
+                        // got a whole chunk, so we can hash it
+                        // is_root is false because there is more data to come
+                        let chunk_hash = state.chunk_state.finalize(false);
+                        state.tree_state.push_subtree(&chunk_hash, CHUNK_SIZE);
+                        // init chunk state for next chunk
+                        let chunk_counter = state.tree_state.count() / CHUNK_SIZE as u64;
+                        state.chunk_state = blake3::guts::ChunkState::new(chunk_counter);
+                        // go into writing hashes state
+                        *self = Self::WritingHashes {
+                            state,
+                            buf: [0; 64],
+                            buf_start: 64,
+                        };
+                        continue;
+                    }
+                    Self::WritingHashes {
                         mut state,
                         buf,
                         mut buf_start,
@@ -1307,44 +1314,33 @@ mod tokio_io {
                         while buf_start < buf.len() {
                             // try to write as much as possible from our hash buffer
                             let res = Pin::new(&mut state.inner).poll_write(cx, &buf[buf_start..]);
-                            match res {
-                                Poll::Pending => {
-                                    // still writing
-                                    self.0 = AsyncEncoderState::WritingHashes {
-                                        state,
-                                        buf,
-                                        buf_start,
-                                    };
-                                    return Poll::Pending;
-                                }
-                                Poll::Ready(Err(e)) => {
-                                    // still writing
-                                    self.0 = AsyncEncoderState::WritingHashes {
-                                        state,
-                                        buf,
-                                        buf_start,
-                                    };
-                                    return Poll::Ready(Err(e));
-                                }
-                                Poll::Ready(Ok(written)) => {
-                                    buf_start += written;
-                                }
+                            // if write was successful, update the buffer start and loop
+                            if let Poll::Ready(Ok(written)) = &res {
+                                buf_start += *written;
+                                continue;
+                            }
+                            // on error or on pending, just restore the state and return
+                            *self = Self::WritingHashes {
+                                state,
+                                buf,
+                                buf_start,
                             };
+                            return res;
                         }
                         // if we get here, we have written the current hash buffer
-                        if let Some(parent) = state.tree_state.merge_parent() {
+                        *self = if let Some(parent) = state.tree_state.merge_parent() {
                             // we have a parent to write
-                            self.0 = AsyncEncoderState::WritingHashes {
+                            Self::WritingHashes {
                                 state,
                                 buf: parent,
                                 buf_start: 0,
-                            };
+                            }
                         } else {
-                            // we are done writing hashes
-                            self.0 = AsyncEncoderState::Writing(state);
-                        }
+                            // we are done writing hashes, go back to writing data
+                            Self::WritingData(state)
+                        };
                     }
-                    AsyncEncoderState::Finalized => {
+                    Self::Finalized => {
                         return Poll::Ready(Err(std::io::Error::new(
                             std::io::ErrorKind::Other,
                             "already finalized",
@@ -1352,37 +1348,149 @@ mod tokio_io {
                     }
                 }
             }
+        }
+    }
 
-            // // If the current chunk is full, we need to finalize it, add it to
-            // // the tree state, and write out any completed parent nodes.
-            // if self.chunk_state.len() == CHUNK_SIZE {
-            //     // This can't be the root, because we know more input is coming.
-            //     let chunk_hash = self.chunk_state.finalize(false);
-            //     self.tree_state.push_subtree(&chunk_hash, CHUNK_SIZE);
-            //     let chunk_counter = self.tree_state.count() / CHUNK_SIZE as u64;
-            //     self.chunk_state = blake3::guts::ChunkState::new(chunk_counter);
-            //     // go into hash writing mode
-            //     while let Some(parent) = self.tree_state.merge_parent() {
-            //         self.buf = parent;
-            //         self.buf_start = 0;
-            //         // self.inner.write_all(&parent)?;
-            //     }
-            // }
+    pub struct AsyncEncoder<T>(AsyncEncoderState<T>);
 
-            // // Add as many bytes as possible to the current chunk.
-            // let want = CHUNK_SIZE - self.chunk_state.len();
-            // let written = if !self.outboard {
-            //     // we are not in outboard state, so we have to pass through the write
-            //     // to the inner writer.
-            //     let take = cmp::min(want, input.len());
-            //     ready!(Pin::new(&mut self.inner).poll_write(cx, &input[..take]))?
-            // } else {
-            //     // we are in outboard state, so we can just pretend the write succeeded
-            //     want
-            // };
-            // // update the chunk state
-            // self.chunk_state.update(&input[..written]);
-            // Poll::Ready(Ok(written))
+    impl<T: AsyncRead + AsyncWrite + AsyncSeek + Unpin> AsyncEncoder<T> {
+        pub fn new(inner: T) -> Self {
+            let state = EncoderShared::new(inner, false);
+            AsyncEncoder(AsyncEncoderState::WritingData(Box::pin(state)))
+        }
+
+        pub fn new_outboard(inner: T) -> Self {
+            let state = EncoderShared::new(inner, true);
+            AsyncEncoder(AsyncEncoderState::WritingData(Box::pin(state)))
+        }
+
+        /// Flip from post order to pre order
+        ///
+        /// This is a verbatim translation of the sync version of this function.
+        async fn flip_post_order_stream(inner: &mut T, outboard: bool) -> io::Result<()> {
+            let mut write_cursor = inner.seek(SeekFrom::End(0)).await?;
+            let mut read_cursor = write_cursor - HEADER_SIZE as u64;
+            let mut header = [0; HEADER_SIZE];
+            inner.seek(SeekFrom::Start(read_cursor)).await?;
+            inner.read_exact(&mut header).await?;
+            let content_len = crate::decode_len(&header);
+            let mut flipper = FlipperState::new(content_len);
+            loop {
+                match flipper.next() {
+                    FlipperNext::FeedParent => {
+                        let mut parent = [0; PARENT_SIZE];
+                        inner
+                            .seek(SeekFrom::Start(read_cursor - PARENT_SIZE as u64))
+                            .await?;
+                        inner.read_exact(&mut parent).await?;
+                        read_cursor -= PARENT_SIZE as u64;
+                        flipper.feed_parent(parent);
+                    }
+                    FlipperNext::TakeParent => {
+                        let parent = flipper.take_parent();
+                        inner
+                            .seek(SeekFrom::Start(write_cursor - PARENT_SIZE as u64))
+                            .await?;
+                        inner.write_all(&parent).await?;
+                        write_cursor -= PARENT_SIZE as u64;
+                    }
+                    FlipperNext::Chunk(size) => {
+                        // In outboard moded, we skip over chunks.
+                        if !outboard {
+                            let mut chunk = [0; CHUNK_SIZE];
+                            inner
+                                .seek(SeekFrom::Start(read_cursor - size as u64))
+                                .await?;
+                            inner.read_exact(&mut chunk[..size]).await?;
+                            read_cursor -= size as u64;
+                            inner
+                                .seek(SeekFrom::Start(write_cursor - size as u64))
+                                .await?;
+                            inner.write_all(&chunk[..size]).await?;
+                            write_cursor -= size as u64;
+                        }
+                        flipper.chunk_moved();
+                    }
+                    FlipperNext::Done => {
+                        debug_assert_eq!(HEADER_SIZE as u64, write_cursor);
+                        inner.seek(SeekFrom::Start(0)).await?;
+                        inner.write_all(&header).await?;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        async fn finalize_inner(
+            mut state: BoxedEncoderShared<T>,
+        ) -> Result<blake3::Hash, std::io::Error> {
+            // Compute the total len before we merge the final chunk into the
+            // tree_state.
+            let total_len = state
+                .tree_state
+                .count()
+                .checked_add(state.chunk_state.len() as u64)
+                .expect("addition overflowed");
+
+            // Finalize the last chunk. Note that any partial chunk bytes retained in the chunk_state
+            // have already been written to the underlying writer by .write().
+            debug_assert!(state.chunk_state.len() > 0 || state.tree_state.count() == 0);
+            let last_chunk_is_root = state.tree_state.count() == 0;
+            let last_chunk_hash = state.chunk_state.finalize(last_chunk_is_root);
+            let last_chunk_len = state.chunk_state.len();
+            state
+                .tree_state
+                .push_subtree(&last_chunk_hash, last_chunk_len);
+
+            // Merge and write all the parents along the right edge.
+            let root_hash;
+            loop {
+                match state.tree_state.merge_finalize() {
+                    StateFinish::Parent(parent) => state.inner.write_all(&parent).await?,
+                    StateFinish::Root(root) => {
+                        root_hash = root;
+                        break;
+                    }
+                }
+            }
+
+            // Write the length header, at the end.
+            state.inner.write_all(&crate::encode_len(total_len)).await?;
+
+            // Finally, flip the tree to be pre-order. This means rewriting the
+            // entire output, so it's expensive.
+            let outboard = state.outboard;
+            Self::flip_post_order_stream(&mut state.inner, outboard).await?;
+
+            Ok(root_hash)
+        }
+
+        pub async fn finalize(mut self) -> Result<blake3::Hash, std::io::Error> {
+            match self.0.take() {
+                AsyncEncoderState::WritingData(state) => Self::finalize_inner(state).await,
+                AsyncEncoderState::HashingChunk(state) => Self::finalize_inner(state).await,
+                AsyncEncoderState::WritingHashes {
+                    mut state,
+                    buf,
+                    buf_start,
+                } => {
+                    state.inner.write_all(&buf[buf_start..]).await?;
+                    Self::finalize_inner(state).await
+                }
+                AsyncEncoderState::Finalized => {
+                    unreachable!("can't finalize twice")
+                }
+            }
+        }
+    }
+
+    impl<T: AsyncRead + AsyncWrite + AsyncSeek + Unpin> AsyncWrite for AsyncEncoder<T> {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            input: &[u8],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            Pin::new(&mut self.0).poll_write(cx, input)
         }
 
         fn poll_flush(
@@ -1390,7 +1498,10 @@ mod tokio_io {
             cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<Result<(), std::io::Error>> {
             match &mut self.0 {
-                AsyncEncoderState::Writing(state) => {
+                AsyncEncoderState::WritingData(state) => {
+                    ready!(Pin::new(&mut state.inner).poll_flush(cx))?;
+                }
+                AsyncEncoderState::HashingChunk(state) => {
                     ready!(Pin::new(&mut state.inner).poll_flush(cx))?;
                 }
                 AsyncEncoderState::WritingHashes { state, .. } => {
@@ -1407,7 +1518,10 @@ mod tokio_io {
             cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<Result<(), std::io::Error>> {
             match &mut self.0 {
-                AsyncEncoderState::Writing(state) => {
+                AsyncEncoderState::HashingChunk(state) => {
+                    ready!(Pin::new(&mut state.inner).poll_shutdown(cx))?;
+                }
+                AsyncEncoderState::WritingData(state) => {
                     ready!(Pin::new(&mut state.inner).poll_shutdown(cx))?;
                 }
                 AsyncEncoderState::WritingHashes { state, .. } => {
@@ -1419,7 +1533,94 @@ mod tokio_io {
             Poll::Ready(Ok(()))
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use std::io;
+
+        use tokio::io::AsyncWriteExt;
+
+        use crate::{
+            decode::make_test_input,
+            encode::{encoded_size, outboard_size, AsyncEncoder},
+        };
+        use blake3::Hash;
+
+        async fn encode(input: impl AsRef<[u8]>) -> (Vec<u8>, Hash) {
+            let bytes = input.as_ref();
+            let mut vec = Vec::with_capacity(encoded_size(bytes.len() as u64) as usize);
+            let mut encoder = AsyncEncoder::new(io::Cursor::new(&mut vec));
+            encoder.write_all(bytes).await.unwrap();
+            let hash = encoder.finalize().await.unwrap();
+            let (encoded0, hash0) = crate::encode::encode(bytes);
+            println!(
+                "{} {} {}",
+                bytes.len(),
+                vec.len(),
+                (vec.len() - bytes.len()) / 64
+            );
+            println!(
+                "{} {} {}",
+                bytes.len(),
+                encoded0.len(),
+                (encoded0.len() - bytes.len()) / 64
+            );
+            (vec, hash)
+        }
+
+        async fn outboard(input: impl AsRef<[u8]>) -> (Vec<u8>, Hash) {
+            let bytes = input.as_ref();
+            let mut vec = Vec::with_capacity(outboard_size(bytes.len() as u64) as usize);
+            let mut encoder = AsyncEncoder::new_outboard(io::Cursor::new(&mut vec));
+            encoder.write_all(bytes).await.unwrap();
+            let hash = todo!(); // encoder.finalize().unwrap();
+            (vec, hash)
+        }
+
+        #[tokio::test]
+        async fn test_async_encode_simple() {
+            let data = vec![0u8; 1024 * 2 - 1];
+            let encoded = encode(&data).await;
+
+            let data = vec![0u8; 1024 * 2];
+            crate::encode::encode(&data);
+            let encoded = encode(&data).await;
+            println!("{:?}", encoded);
+        }
+
+        #[tokio::test]
+        async fn test_async_encode() {
+            for &case in crate::test::TEST_CASES {
+                println!("case {}", case);
+                let input = make_test_input(case);
+                let expected_hash = blake3::hash(&input);
+                let (encoded, hash) = encode(&input).await;
+                assert_eq!(expected_hash, hash);
+                assert_eq!(encoded.len() as u128, encoded_size(case as u64));
+                assert_eq!(encoded.len(), encoded.capacity());
+                assert_eq!(
+                    encoded.len() as u128,
+                    case as u128 + outboard_size(case as u64)
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn test_async_outboard_encode() {
+            for &case in crate::test::TEST_CASES {
+                println!("case {}", case);
+                let input = make_test_input(case);
+                let expected_hash = blake3::hash(&input);
+                let (outboard, hash) = outboard(&input).await;
+                assert_eq!(expected_hash, hash);
+                assert_eq!(outboard.len() as u128, outboard_size(case as u64));
+                assert_eq!(outboard.len(), outboard.capacity());
+            }
+        }
+    }
 }
+#[cfg(feature = "tokio_io")]
+pub use tokio_io::AsyncEncoder;
 
 #[cfg(test)]
 mod test {
