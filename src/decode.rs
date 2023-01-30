@@ -489,13 +489,11 @@ mod tokio_io {
             loop {
                 match self.state.read_next() {
                     NextRead::Done => {
-                        // This is EOF. We know the internal buffer is empty,
-                        // because we checked it before this loop.
+                        // This is EOF.
                         break Poll::Ready(Ok(()));
                     }
                     NextRead::Header => {
-                        // ensure reading state, reading 8 bytes
-                        // we might already be in the reading state,
+                        // read 8 bytes
                         // header comes from outboard if we have one, otherwise from input
                         ready!(self.poll_fill_buffer_from_input_or_outboard(8, cx))?;
                         self.state.feed_header(self.buf[0..8].try_into().unwrap());
@@ -503,8 +501,7 @@ mod tokio_io {
                         self.clear_buf();
                     }
                     NextRead::Parent => {
-                        // ensure reading state, reading 64 bytes
-                        // we might already be in the reading state,
+                        // read 64 bytes
                         // parent comes from outboard if we have one, otherwise from input
                         ready!(self.poll_fill_buffer_from_input_or_outboard(64, cx))?;
                         self.state
@@ -518,11 +515,7 @@ mod tokio_io {
                         skip,
                         index,
                     } => {
-                        // todo: add direct output optimization
-
-                        // ensure reading state, reading size bytes
-                        // we might already be in the reading state,
-                        // so we must not set buf_start to 0
+                        // read size bytes
                         // chunk never comes from outboard
                         ready!(self.poll_fill_buffer_from_input(size, cx))?;
 
@@ -560,8 +553,7 @@ mod tokio_io {
         ) -> Poll<io::Result<bool>> {
             Poll::Ready(Ok(match next {
                 NextRead::Header => {
-                    // ensure reading state, reading 8 bytes
-                    // we might already be in the reading state,
+                    // read 8 bytes
                     // header comes from outboard if we have one, otherwise from input
                     ready!(self.poll_fill_buffer_from_input_or_outboard(8, cx))?;
                     self.state.feed_header(self.buf[0..8].try_into().unwrap());
@@ -571,8 +563,7 @@ mod tokio_io {
                     false
                 }
                 NextRead::Parent => {
-                    // ensure reading state, reading 64 bytes
-                    // we might already be in the reading state,
+                    // read 64 bytes
                     // parent comes from outboard if we have one, otherwise from input
                     ready!(self.poll_fill_buffer_from_input_or_outboard(64, cx))?;
                     self.state
@@ -588,8 +579,7 @@ mod tokio_io {
                     skip: _,
                     index,
                 } => {
-                    // ensure reading state, reading size bytes
-                    // we might already be in the reading state,
+                    // read size bytes
                     // chunk never comes from outboard
                     ready!(self.poll_fill_buffer_from_input(size, cx))?;
 
@@ -748,7 +738,8 @@ mod tokio_io {
 
     /// state of the decoder
     ///
-    /// this is a separate type so it can be private
+    /// This is the decoder, but it is a separate type so it can be private.
+    /// The public AsyncDecoder just wraps this.
     enum DecoderState<T: AsyncRead + Unpin, O: AsyncRead + Unpin> {
         /// we are reading from the underlying reader
         Reading(BoxedDecoderShared<T, O>),
@@ -778,26 +769,15 @@ mod tokio_io {
             loop {
                 match self.take() {
                     Self::Reading(mut shared) => {
-                        match shared.poll_input(cx) {
-                            Poll::Ready(Ok(())) => {
-                                // we have read a chunk from the underlying reader
-                                // go to output state
-                                *self = Self::Output(shared);
-                                continue;
-                            }
-                            Poll::Ready(Err(e)) => {
-                                // we got an error from the underlying io
-                                // stay in reading state
-                                *self = Self::Reading(shared);
-                                break Poll::Ready(Err(e));
-                            }
-                            Poll::Pending => {
-                                // we don't have a complete chunk yet
-                                // stay in reading state
-                                *self = Self::Output(shared);
-                                break Poll::Pending;
-                            }
+                        let res = shared.poll_input(cx);
+                        if let Poll::Ready(Ok(())) = res {
+                            // we have read a chunk from the underlying reader
+                            // go to output state
+                            *self = Self::Output(shared);
+                            continue;
                         }
+                        *self = Self::Reading(shared);
+                        break res;
                     }
                     Self::Output(mut shared) => {
                         shared.write_output(buf);
@@ -813,41 +793,14 @@ mod tokio_io {
                         };
                         break Poll::Ready(Ok(()));
                     }
-                    Self::Seeking(shared) => {
-                        *self = Self::Seeking(shared);
-                        break Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "seeking")));
+                    DecoderState::Seeking(_) => {
+                        break Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "seeking")))
                     }
                     DecoderState::Invalid => {
                         break Poll::Ready(Ok(()));
                     }
                 }
             }
-        }
-    }
-
-    pub struct AsyncDecoder<T: AsyncRead + Unpin, O: AsyncRead + Unpin>(DecoderState<T, O>);
-
-    impl<T: AsyncRead + Unpin> AsyncDecoder<T, T> {
-        pub fn new(inner: T, hash: &Hash) -> Self {
-            let state = DecoderShared::new(inner, None, hash);
-            Self(DecoderState::Reading(Box::pin(state)))
-        }
-    }
-
-    impl<T: AsyncRead + Unpin, O: AsyncRead + Unpin> AsyncDecoder<T, O> {
-        pub fn new_outboard(inner: T, outboard: O, hash: &Hash) -> Self {
-            let state = DecoderShared::new(inner, Some(outboard), hash);
-            Self(DecoderState::Reading(Box::pin(state)))
-        }
-    }
-
-    impl<T: AsyncRead + Unpin, O: AsyncRead + Unpin> AsyncRead for AsyncDecoder<T, O> {
-        fn poll_read(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            buf: &mut ReadBuf<'_>,
-        ) -> Poll<io::Result<()>> {
-            Pin::new(&mut self.0).poll_read(cx, buf)
         }
     }
 
@@ -940,6 +893,32 @@ mod tokio_io {
             }
         }
     }
+    pub struct AsyncDecoder<T: AsyncRead + Unpin, O: AsyncRead + Unpin>(DecoderState<T, O>);
+
+    impl<T: AsyncRead + Unpin> AsyncDecoder<T, T> {
+        pub fn new(inner: T, hash: &Hash) -> Self {
+            let state = DecoderShared::new(inner, None, hash);
+            Self(DecoderState::Reading(Box::pin(state)))
+        }
+    }
+
+    impl<T: AsyncRead + Unpin, O: AsyncRead + Unpin> AsyncDecoder<T, O> {
+        pub fn new_outboard(inner: T, outboard: O, hash: &Hash) -> Self {
+            let state = DecoderShared::new(inner, Some(outboard), hash);
+            Self(DecoderState::Reading(Box::pin(state)))
+        }
+    }
+
+    impl<T: AsyncRead + Unpin, O: AsyncRead + Unpin> AsyncRead for AsyncDecoder<T, O> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+
     pub struct SliceDecoderInner<T: AsyncRead + Unpin> {
         shared: DecoderShared<T, T>,
         slice_start: u64,
