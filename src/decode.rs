@@ -904,6 +904,24 @@ mod tokio_io {
             let state = DecoderShared::new(inner, Some(outboard), hash);
             Self(DecoderState::Reading(Box::pin(state)))
         }
+
+        pub fn into_inner(self) -> io::Result<(T, Option<O>)> {
+            let mut this = self;
+            match this.0.take() {
+                DecoderState::Reading(state) => {
+                    let x = *Pin::into_inner(state);
+                    Ok((x.input, x.outboard))
+                },
+                DecoderState::Output(state) => {
+                    let x = *Pin::into_inner(state);
+                    Ok((x.input, x.outboard))
+                },
+                DecoderState::Seeking(_) => {
+                    Err(io::Error::new(io::ErrorKind::Other, "seek in progress"))
+                },
+                DecoderState::Invalid => unreachable!(),
+            }
+        }
     }
 
     impl<T: AsyncRead + Unpin, O: AsyncRead + Unpin> AsyncRead for AsyncDecoder<T, O> {
@@ -1073,6 +1091,23 @@ mod tokio_io {
                 let mut reader = AsyncDecoder::new(&encoded[..], &hash);
                 reader.read_to_end(&mut output).await.unwrap();
                 assert_eq!(input, output);
+            }
+        }
+
+        #[tokio::test]
+        async fn test_async_decode_eof() {
+            for &case in crate::test::TEST_CASES {
+                use tokio::io::AsyncReadExt;
+                println!("case {case}");
+                let input = make_test_input(case);
+                let (encoded, hash) = { encode::encode(&input) };
+                let mut extended = encoded.clone();
+                extended.extend_from_slice(&[0u8;123]);
+                let mut output = Vec::new();
+                let mut reader = AsyncDecoder::new(&extended[..], &hash);
+                reader.read_to_end(&mut output).await.unwrap();
+                assert_eq!(input, output);
+                let x = reader.into_inner().unwrap();
             }
         }
 
