@@ -680,7 +680,10 @@ mod tokio_io {
         ///
         /// note that even when passing i SeekFrom::Current, the actual seek is done from
         /// the start of the file. So we don't have to worry about the internal state.
-        async fn seek_fut(self: Pin<Box<Self>>, pos: SeekFrom) -> (Pin<Box<Self>>, io::Result<u64>) {
+        async fn seek_fut(
+            self: Pin<Box<Self>>,
+            pos: SeekFrom,
+        ) -> (Pin<Box<Self>>, io::Result<u64>) {
             let mut this = self;
             let result = this.seek_fut_inner(pos).await;
             (this, result)
