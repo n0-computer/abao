@@ -36,8 +36,8 @@
 //! ```
 
 use crate::encode::NextRead;
-use crate::{encode, ChunkGroupState};
-use crate::{Finalization, Hash, GROUP_SIZE, HEADER_SIZE, MAX_DEPTH, PARENT_SIZE};
+use crate::{encode, ChunkGroupState, group_size};
+use crate::{Finalization, Hash, HEADER_SIZE, MAX_DEPTH, PARENT_SIZE};
 use arrayref::array_ref;
 use arrayvec::ArrayVec;
 use std::cmp;
@@ -49,20 +49,20 @@ use std::io::SeekFrom;
 
 /// Decode an entire slice in the default combined mode into a bytes vector.
 /// This is a convenience wrapper around `Decoder`.
-pub fn decode(encoded: impl AsRef<[u8]>, hash: &Hash) -> io::Result<Vec<u8>> {
+pub fn decode<const GROUP_CHUNKS: usize>(encoded: impl AsRef<[u8]>, hash: &Hash) -> io::Result<Vec<u8>> {
     let bytes = encoded.as_ref();
     if bytes.len() < HEADER_SIZE {
         return Err(Error::Truncated.into());
     }
     let content_len = crate::decode_len(array_ref!(bytes, 0, HEADER_SIZE));
     // Sanity check the length before making a potentially large allocation.
-    if (bytes.len() as u128) < encode::encoded_size(content_len) {
+    if (bytes.len() as u128) < encode::encoded_size::<1>(content_len) {
         return Err(Error::Truncated.into());
     }
     // There's no way to avoid zeroing this vector without unsafe code, because
     // Decoder::initializer is the default (safe) zeroing implementation anyway.
     let mut vec = vec![0; content_len as usize];
-    let mut reader = Decoder::new(bytes, hash);
+    let mut reader = Decoder::<_, _, 1>::new(bytes, hash);
     reader.read_exact(&mut vec)?;
     // One more read to confirm EOF. This is redundant in most cases, but in
     // the empty encoding case read_exact won't do any reads at all, and the Ok
@@ -207,22 +207,22 @@ impl From<Error> for io::Error {
 
 // Shared between Decoder and SliceDecoder.
 #[derive(Clone)]
-struct DecoderShared<T, O> {
+struct DecoderShared<T, O, const GROUP_CHUNKS: usize = 1> {
     input: T,
     outboard: Option<O>,
     state: VerifyState,
-    buf: [u8; GROUP_SIZE],
+    buf: Vec<u8>,
     buf_start: usize,
     buf_end: usize,
 }
 
-impl<T, O> DecoderShared<T, O> {
+impl<T, O, const GROUP_CHUNKS: usize> DecoderShared<T, O, GROUP_CHUNKS> {
     fn new(input: T, outboard: Option<O>, hash: &Hash) -> Self {
         Self {
             input,
             outboard,
             state: VerifyState::new(hash),
-            buf: [0; GROUP_SIZE],
+            buf: vec![0; group_size(GROUP_CHUNKS)],
             buf_start: 0,
             buf_end: 0,
         }
@@ -244,7 +244,7 @@ impl<T, O> DecoderShared<T, O> {
     }
 }
 
-impl<T: Read, O: Read> DecoderShared<T, O> {
+impl<T: Read, O: Read, const GROUP_CHUNKS: usize> DecoderShared<T, O, GROUP_CHUNKS> {
     // These bytes are always verified before going in the buffer.
     fn take_buffered_bytes(&mut self, output: &mut [u8]) -> usize {
         let take = cmp::min(self.buf_len(), output.len());
@@ -301,7 +301,7 @@ impl<T: Read, O: Read> DecoderShared<T, O> {
         }
         let buf_slice = &mut self.buf[..size];
         self.input.read_exact(buf_slice)?;
-        let hash = ChunkGroupState::new(index)
+        let hash = ChunkGroupState::<GROUP_CHUNKS>::new(index)
             .update(buf_slice)
             .finalize(finalization.is_root());
         self.state.feed_chunk(&hash)?;
@@ -363,7 +363,7 @@ impl<T: Read, O: Read> DecoderShared<T, O> {
                     // Hash it and push its hash into the VerifyState. This
                     // returns an error if the hash is bad. Otherwise, the
                     // chunk is verifiied.
-                    let chunk_hash = ChunkGroupState::new(index)
+                    let chunk_hash = ChunkGroupState::<GROUP_CHUNKS>::new(index)
                         .update(read_buf)
                         .finalize(finalization.is_root());
                     self.state.feed_chunk(&chunk_hash)?;
@@ -415,7 +415,7 @@ impl<T: Read, O: Read> DecoderShared<T, O> {
     }
 }
 
-impl<T: Read + Seek, O: Read + Seek> DecoderShared<T, O> {
+impl<T: Read + Seek, O: Read + Seek, const GROUP_CHUNKS: usize> DecoderShared<T, O, GROUP_CHUNKS> {
     // The Decoder will call this as part of seeking, but note that the
     // SliceDecoder won't, because all the seek bookkeeping has already been
     // taken care of during slice extraction.
@@ -443,7 +443,7 @@ impl<T: Read + Seek, O: Read + Seek> DecoderShared<T, O> {
     }
 }
 
-impl<T, O> fmt::Debug for DecoderShared<T, O> {
+impl<T, O, const GROUP_CHUNKS: usize> fmt::Debug for DecoderShared<T, O, GROUP_CHUNKS> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
@@ -473,7 +473,7 @@ mod tokio_io {
     use tokio::io::{AsyncRead, ReadBuf};
 
     // tokio flavour async io utilities, requiing AsyncRead
-    impl<T: AsyncRead + Unpin, O: AsyncRead + Unpin> DecoderShared<T, O> {
+    impl<T: AsyncRead + Unpin, O: AsyncRead + Unpin, const GROUP_CHUNKS: usize> DecoderShared<T, O, GROUP_CHUNKS> {
         /// write from the internal buffer to the output buffer
         fn write_output(&mut self, buf: &mut ReadBuf<'_>) {
             let n = cmp::min(buf.remaining(), self.buf_len());
@@ -536,7 +536,7 @@ mod tokio_io {
                         // returns an error if the hash is bad. Otherwise, the
                         // chunk is verified.
                         let read_buf = &self.buf[0..size];
-                        let chunk_hash = ChunkGroupState::new(index)
+                        let chunk_hash = ChunkGroupState::<GROUP_CHUNKS>::new(index)
                             .update(read_buf)
                             .finalize(finalization.is_root());
                         self.state.feed_chunk(&chunk_hash)?;
@@ -600,7 +600,7 @@ mod tokio_io {
                     // returns an error if the hash is bad. Otherwise, the
                     // chunk is verified.
                     let read_buf = &self.buf[0..size];
-                    let chunk_hash = ChunkGroupState::new(index)
+                    let chunk_hash = ChunkGroupState::<GROUP_CHUNKS>::new(index)
                         .update(read_buf)
                         .finalize(finalization.is_root());
                     self.state.feed_chunk(&chunk_hash)?;
@@ -943,7 +943,7 @@ mod tokio_io {
                 use tokio::io::AsyncReadExt;
                 println!("case {case}");
                 let input = make_test_input(case);
-                let (encoded, hash) = { encode::encode(&input) };
+                let (encoded, hash) = { encode::encode::<1>(&input) };
                 let mut output = Vec::new();
                 let mut reader = AsyncDecoder::new(&encoded[..], &hash);
                 reader.read_to_end(&mut output).await.unwrap();
@@ -957,7 +957,7 @@ mod tokio_io {
                 use tokio::io::AsyncReadExt;
                 println!("case {case}");
                 let input = make_test_input(case);
-                let (outboard, hash) = { encode::outboard(&input) };
+                let (outboard, hash) = { encode::outboard::<1>(&input) };
                 let mut output = Vec::new();
                 let mut reader = AsyncDecoder::new_outboard(&input[..], &outboard[..], &hash);
                 reader.read_to_end(&mut output).await.unwrap();
@@ -969,9 +969,9 @@ mod tokio_io {
         async fn test_async_slices() {
             for &case in crate::test::TEST_CASES {
                 let input = make_test_input(case);
-                let (encoded, hash) = encode::encode(&input);
+                let (encoded, hash) = encode::encode::<1>(&input);
                 // Also make an outboard encoding, to test that case.
-                let (outboard, outboard_hash) = encode::outboard(&input);
+                let (outboard, outboard_hash) = encode::outboard::<1>(&input);
                 assert_eq!(hash, outboard_hash);
                 for &slice_start in crate::test::TEST_CASES {
                     let expected_start = cmp::min(input.len(), slice_start);
@@ -1019,7 +1019,7 @@ mod tokio_io {
             let input = make_test_input(20_000);
             let slice_start = 5_000;
             let slice_len = 10_000;
-            let (encoded, hash) = encode::encode(&input);
+            let (encoded, hash) = encode::encode::<1>(&input);
 
             // Slice out the middle 10_000 bytes;
             let mut slice = Vec::new();
@@ -1032,13 +1032,13 @@ mod tokio_io {
 
             // First confirm that the regular decode works.
             let mut output = Vec::new();
-            let mut reader =
+            let mut reader: SliceDecoder<_, 1> =
                 SliceDecoder::new(&*slice, &hash, slice_start as u64, slice_len as u64);
             reader.read_to_end(&mut output).unwrap();
             assert_eq!(&input[slice_start..][..slice_len], &*output);
 
             // Also confirm that the outboard slice extractor gives the same slice.
-            let (outboard, outboard_hash) = encode::outboard(&input);
+            let (outboard, outboard_hash) = encode::outboard::<1>(&input);
             assert_eq!(hash, outboard_hash);
             let mut slice_from_outboard = Vec::new();
             let mut extractor = encode::SliceExtractor::new_outboard(
@@ -1114,11 +1114,11 @@ pub use tokio_io::{AsyncDecoder, AsyncSliceDecoder};
 /// # }
 /// ```
 #[derive(Clone, Debug)]
-pub struct Decoder<T: Read, O: Read> {
-    shared: DecoderShared<T, O>,
+pub struct Decoder<T: Read, O: Read, const GROUP_CHUNKS: usize = 1> {
+    shared: DecoderShared<T, O, GROUP_CHUNKS>,
 }
 
-impl<T: Read> Decoder<T, T> {
+impl<T: Read, const GROUP_CHUNKS: usize> Decoder<T, T, GROUP_CHUNKS> {
     /// Create a new `Decoder` that reads encoded data from `inner` and verifies
     /// the hash incrementally while reading.
     pub fn new(inner: T, hash: &Hash) -> Self {
@@ -1128,7 +1128,7 @@ impl<T: Read> Decoder<T, T> {
     }
 }
 
-impl<T: Read, O: Read> Decoder<T, O> {
+impl<T: Read, O: Read, const GROUP_CHUNKS: usize> Decoder<T, O, GROUP_CHUNKS> {
     /// Create a new `Decoder` that reads data form `inner` and outboard data
     /// from `outboard` and verifies the hash incrementally while reading.
     pub fn new_outboard(inner: T, outboard: O, hash: &Hash) -> Self {
@@ -1144,13 +1144,13 @@ impl<T: Read, O: Read> Decoder<T, O> {
     }
 }
 
-impl<T: Read, O: Read> Read for Decoder<T, O> {
+impl<T: Read, O: Read, const GROUP_CHUNKS: usize> Read for Decoder<T, O, GROUP_CHUNKS> {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
         self.shared.read(output)
     }
 }
 
-impl<T: Read + Seek, O: Read + Seek> Seek for Decoder<T, O> {
+impl<T: Read + Seek, O: Read + Seek, const GROUP_CHUNKS: usize> Seek for Decoder<T, O, GROUP_CHUNKS> {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         // Clear the internal buffer when seeking. The buffered bytes won't be
         // valid reads at the new offset.
@@ -1257,8 +1257,8 @@ fn add_offset(position: u64, offset: i64) -> io::Result<u64> {
 /// # }
 /// ```
 #[derive(Debug)]
-pub struct SliceDecoder<T: Read> {
-    shared: DecoderShared<T, T>,
+pub struct SliceDecoder<T: Read, const GROUP_CHUNKS: usize> {
+    shared: DecoderShared<T, T, GROUP_CHUNKS>,
     slice_start: u64,
     slice_remaining: u64,
     // If the caller requested no bytes, the extractor is still required to
@@ -1267,7 +1267,7 @@ pub struct SliceDecoder<T: Read> {
     need_fake_read: bool,
 }
 
-impl<T: Read> SliceDecoder<T> {
+impl<T: Read, const GROUP_CHUNKS: usize> SliceDecoder<T, GROUP_CHUNKS> {
     /// Create a new slice decoder that reads an encoded slice from `inner`.
     ///
     /// The `hash` parameter is the hash of the entire input, not just the slice.
@@ -1292,7 +1292,7 @@ impl<T: Read> SliceDecoder<T> {
     }
 }
 
-impl<T: Read> Read for SliceDecoder<T> {
+impl<T: Read, const GROUP_CHUNKS: usize> Read for SliceDecoder<T, GROUP_CHUNKS> {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
         // If we haven't done the initial seek yet, do the full seek loop
         // first. Note that this will never leave any buffered output. The only
@@ -1370,8 +1370,8 @@ mod test {
         for &case in crate::test::TEST_CASES {
             println!("case {case}");
             let input = make_test_input(case);
-            let (encoded, hash) = { encode::encode(&input) };
-            let output = decode(&encoded, &hash).unwrap();
+            let (encoded, hash) = { encode::encode::<1>(&input) };
+            let output = decode::<1>(&encoded, &hash).unwrap();
             assert_eq!(input, output);
             assert_eq!(output.len(), output.capacity());
         }
@@ -1382,9 +1382,9 @@ mod test {
         for &case in crate::test::TEST_CASES {
             println!("case {case}");
             let input = make_test_input(case);
-            let (outboard, hash) = { encode::outboard(&input) };
+            let (outboard, hash) = { encode::outboard::<1>(&input) };
             let mut output = Vec::new();
-            let mut reader = Decoder::new_outboard(&input[..], &outboard[..], &hash);
+            let mut reader: Decoder<_, _, 1> = Decoder::new_outboard(&input[..], &outboard[..], &hash);
             reader.read_to_end(&mut output).unwrap();
             assert_eq!(input, output);
         }
@@ -1395,7 +1395,7 @@ mod test {
         for &case in crate::test::TEST_CASES {
             println!("case {case}");
             let input = make_test_input(case);
-            let (encoded, hash) = encode::encode(&input);
+            let (encoded, hash) = encode::encode::<1>(&input);
             // Don't tweak the header in this test, because that usually causes a panic.
             let mut tweaks = Vec::new();
             if encoded.len() > HEADER_SIZE {
@@ -1404,15 +1404,15 @@ mod test {
             if encoded.len() > HEADER_SIZE + PARENT_SIZE {
                 tweaks.push(HEADER_SIZE + PARENT_SIZE);
             }
-            if encoded.len() > GROUP_SIZE {
-                tweaks.push(GROUP_SIZE);
+            if encoded.len() > group_size(1) {
+                tweaks.push(group_size(1));
             }
             for tweak in tweaks {
                 println!("tweak {tweak}");
                 let mut bad_encoded = encoded.clone();
                 bad_encoded[tweak] ^= 1;
 
-                let err = decode(&bad_encoded, &hash).unwrap_err();
+                let err = decode::<1>(&bad_encoded, &hash).unwrap_err();
                 assert_eq!(err.kind(), io::ErrorKind::InvalidData);
             }
         }
@@ -1424,7 +1424,7 @@ mod test {
             println!();
             println!("input_len {input_len}");
             let input = make_test_input(input_len);
-            let (encoded, hash) = encode::encode(&input);
+            let (encoded, hash) = encode::encode::<1>(&input);
             for &seek in crate::test::TEST_CASES {
                 println!("seek {seek}");
                 // Test all three types of seeking.
@@ -1434,7 +1434,7 @@ mod test {
                 seek_froms.push(SeekFrom::Current(seek as i64));
                 for seek_from in seek_froms {
                     println!("seek_from {seek_from:?}");
-                    let mut decoder = Decoder::new(Cursor::new(&encoded), &hash);
+                    let mut decoder: Decoder<_, _, 1> = Decoder::new(Cursor::new(&encoded), &hash);
                     let mut output = Vec::new();
                     decoder.seek(seek_from).expect("seek error");
                     decoder.read_to_end(&mut output).expect("decoder error");
@@ -1453,12 +1453,12 @@ mod test {
     fn test_repeated_random_seeks() {
         // A chunk number like this (37) with consecutive zeroes should exercise some of the more
         // interesting geometry cases.
-        let input_len = 0b100101 * GROUP_SIZE;
+        let input_len = 0b100101 * group_size(1);
         println!("\n\ninput_len {input_len}");
         let mut prng = ChaChaRng::from_seed([0; 32]);
         let input = make_test_input(input_len);
-        let (encoded, hash) = encode::encode(&input);
-        let mut decoder = Decoder::new(Cursor::new(&encoded), &hash);
+        let (encoded, hash) = encode::encode::<1>(&input);
+        let mut decoder: Decoder<_, _, 1> = Decoder::new(Cursor::new(&encoded), &hash);
         // Do a thousand random seeks and chunk-sized reads.
         for _ in 0..1000 {
             let seek = prng.gen_range(0..input_len + 1);
@@ -1470,11 +1470,11 @@ mod test {
             let mut output = Vec::new();
             decoder
                 .clone()
-                .take(GROUP_SIZE as u64)
+                .take(group_size(1) as u64)
                 .read_to_end(&mut output)
                 .expect("decoder error");
             let input_start = cmp::min(seek, input_len);
-            let input_end = cmp::min(input_start + GROUP_SIZE, input_len);
+            let input_end = cmp::min(input_start + group_size(1), input_len);
             assert_eq!(
                 &input[input_start..input_end],
                 &output[..],
@@ -1491,18 +1491,18 @@ mod test {
         // distinguish the state "just decoded the zero length" from the state "verified the hash
         // of the empty root node", and a decoder must not return EOF before the latter.
 
-        let (zero_encoded, zero_hash) = encode::encode(b"");
+        let (zero_encoded, zero_hash) = encode::encode::<1>(b"");
         let one_hash = blake3::hash(b"x");
 
         // Decoding the empty tree with the right hash should succeed.
         let mut output = Vec::new();
-        let mut decoder = Decoder::new(&*zero_encoded, &zero_hash);
+        let mut decoder: Decoder<_, _, 1> = Decoder::new(&*zero_encoded, &zero_hash);
         decoder.read_to_end(&mut output).unwrap();
         assert_eq!(output.len(), 0);
 
         // Decoding the empty tree with any other hash should fail.
         let mut output = Vec::new();
-        let mut decoder = Decoder::new(&*zero_encoded, &one_hash);
+        let mut decoder: Decoder<_, _, 1> = Decoder::new(&*zero_encoded, &one_hash);
         let result = decoder.read_to_end(&mut output);
         assert!(result.is_err(), "a bad hash is supposed to fail!");
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
@@ -1513,26 +1513,26 @@ mod test {
         for &case in crate::test::TEST_CASES {
             // Skip the cases with only one or two chunks, so we have valid
             // reads before and after the tweak.
-            if case <= 2 * GROUP_SIZE {
+            if case <= 2 * group_size(1) {
                 continue;
             }
 
             println!("\ncase {case}");
             let input = make_test_input(case);
-            let (mut encoded, hash) = encode::encode(&input);
+            let (mut encoded, hash) = encode::encode::<1>(&input);
             println!("encoded len {}", encoded.len());
 
             // Tweak a bit at the start of a chunk about halfway through. Loop
             // over prior parent nodes and chunks to figure out where the
             // target chunk actually starts.
-            let tweak_chunk = encode::count_chunks(case as u64) / 2;
-            let tweak_position = tweak_chunk as usize * GROUP_SIZE;
+            let tweak_chunk = encode::count_chunks::<1>(case as u64) / 2;
+            let tweak_position = tweak_chunk as usize * group_size(1);
             println!("tweak position {tweak_position}");
             let mut tweak_encoded_offset = HEADER_SIZE;
             for chunk in 0..tweak_chunk {
                 tweak_encoded_offset +=
                     encode::pre_order_parent_nodes(chunk, case as u64) as usize * PARENT_SIZE;
-                tweak_encoded_offset += GROUP_SIZE;
+                tweak_encoded_offset += group_size(1);
             }
             tweak_encoded_offset +=
                 encode::pre_order_parent_nodes(tweak_chunk, case as u64) as usize * PARENT_SIZE;
@@ -1541,18 +1541,18 @@ mod test {
 
             // Read all the bits up to that tweak. Because it's right after a chunk boundary, the
             // read should succeed.
-            let mut decoder = Decoder::new(Cursor::new(&encoded), &hash);
+            let mut decoder: Decoder<_, _, 1> = Decoder::new(Cursor::new(&encoded), &hash);
             let mut output = vec![0; tweak_position];
             decoder.read_exact(&mut output).unwrap();
             assert_eq!(&input[..tweak_position], &*output);
 
             // Further reads at this point should fail.
-            let mut buf = [0; GROUP_SIZE];
+            let mut buf = vec![0; group_size(1)];
             let res = decoder.read(&mut buf);
             assert_eq!(res.unwrap_err().kind(), io::ErrorKind::InvalidData);
 
             // But now if we seek past the bad chunk, things should succeed again.
-            let new_start = tweak_position + GROUP_SIZE;
+            let new_start = tweak_position + group_size(1);
             decoder.seek(SeekFrom::Start(new_start as u64)).unwrap();
             let mut output = Vec::new();
             decoder.read_to_end(&mut output).unwrap();
@@ -1566,11 +1566,11 @@ mod test {
         // past EOF.
         for &case in crate::test::TEST_CASES {
             let input = make_test_input(case);
-            let (encoded, hash) = encode::encode(&input);
+            let (encoded, hash) = encode::encode::<1>(&input);
 
             // Seeking to EOF should succeed with the right hash.
             let mut output = Vec::new();
-            let mut decoder = Decoder::new(Cursor::new(&encoded), &hash);
+            let mut decoder: Decoder<_, _, 1> = Decoder::new(Cursor::new(&encoded), &hash);
             decoder.seek(SeekFrom::Start(case as u64)).unwrap();
             decoder.read_to_end(&mut output).unwrap();
             assert_eq!(output.len(), 0);
@@ -1579,7 +1579,7 @@ mod test {
             let mut bad_hash_bytes = *hash.as_bytes();
             bad_hash_bytes[0] ^= 1;
             let bad_hash = bad_hash_bytes.into();
-            let mut decoder = Decoder::new(Cursor::new(&encoded), &bad_hash);
+            let mut decoder: Decoder<_, _, 1> = Decoder::new(Cursor::new(&encoded), &bad_hash);
             let result = decoder.seek(SeekFrom::Start(case as u64));
             assert!(result.is_err(), "a bad hash is supposed to fail!");
             assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
@@ -1588,7 +1588,7 @@ mod test {
             if case > 0 {
                 let mut bad_encoded = encoded.clone();
                 *bad_encoded.last_mut().unwrap() ^= 1;
-                let mut decoder = Decoder::new(Cursor::new(&bad_encoded), &hash);
+                let mut decoder: Decoder<_, _, 1> = Decoder::new(Cursor::new(&bad_encoded), &hash);
                 let result = decoder.seek(SeekFrom::Start(case as u64));
                 assert!(result.is_err(), "a bad hash is supposed to fail!");
                 assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
@@ -1600,13 +1600,13 @@ mod test {
     fn test_slices() {
         for &case in crate::test::TEST_CASES {
             let input = make_test_input(case);
-            let (encoded, hash) = encode::encode(&input);
+            let (encoded, hash) = encode::encode::<1>(&input);
             // Also make an outboard encoding, to test that case.
-            let (outboard, outboard_hash) = encode::outboard(&input);
+            let (outboard, outboard_hash) = encode::outboard::<1>(&input);
             assert_eq!(hash, outboard_hash);
             for &slice_start in crate::test::TEST_CASES {
                 let expected_start = cmp::min(input.len(), slice_start);
-                let slice_lens = [0, 1, 2, GROUP_SIZE - 1, GROUP_SIZE, GROUP_SIZE + 1];
+                let slice_lens = [0, 1, 2, group_size(1) - 1, group_size(1), group_size(1) + 1];
                 for &slice_len in slice_lens.iter() {
                     println!("\ncase {case} start {slice_start} len {slice_len}");
                     let expected_end = cmp::min(input.len(), slice_start + slice_len);
@@ -1631,7 +1631,7 @@ mod test {
                     assert_eq!(slice, slice_from_outboard);
 
                     let mut output = Vec::new();
-                    let mut reader =
+                    let mut reader: SliceDecoder<_, 1> =
                         SliceDecoder::new(&*slice, &hash, slice_start as u64, slice_len as u64);
                     reader.read_to_end(&mut output).unwrap();
                     assert_eq!(expected_output, &*output);
@@ -1645,7 +1645,7 @@ mod test {
         let input = make_test_input(20_000);
         let slice_start = 5_000;
         let slice_len = 10_000;
-        let (encoded, hash) = encode::encode(&input);
+        let (encoded, hash) = encode::encode::<1>(&input);
 
         // Slice out the middle 10_000 bytes;
         let mut slice = Vec::new();
@@ -1658,12 +1658,12 @@ mod test {
 
         // First confirm that the regular decode works.
         let mut output = Vec::new();
-        let mut reader = SliceDecoder::new(&*slice, &hash, slice_start as u64, slice_len as u64);
+        let mut reader: SliceDecoder<_, 1> = SliceDecoder::new(&*slice, &hash, slice_start as u64, slice_len as u64);
         reader.read_to_end(&mut output).unwrap();
         assert_eq!(&input[slice_start..][..slice_len], &*output);
 
         // Also confirm that the outboard slice extractor gives the same slice.
-        let (outboard, outboard_hash) = encode::outboard(&input);
+        let (outboard, outboard_hash) = encode::outboard::<1>(&input);
         assert_eq!(hash, outboard_hash);
         let mut slice_from_outboard = Vec::new();
         let mut extractor = encode::SliceExtractor::new_outboard(
@@ -1684,7 +1684,7 @@ mod test {
         while i < slice.len() {
             let mut slice_clone = slice.clone();
             slice_clone[i] ^= 1;
-            let mut reader =
+            let mut reader: SliceDecoder<_, 1> =
                 SliceDecoder::new(&*slice_clone, &hash, slice_start as u64, slice_len as u64);
             output.clear();
             let err = reader.read_to_end(&mut output).unwrap_err();
@@ -1702,8 +1702,8 @@ mod test {
         for &case in crate::test::TEST_CASES {
             println!("case {case}");
             let input = make_test_input(case);
-            let (encoded, _) = encode::encode(&input);
-            let (outboard, _) = encode::outboard(&input);
+            let (encoded, _) = encode::encode::<1>(&input);
+            let (outboard, _) = encode::outboard::<1>(&input);
             let mut slice = Vec::new();
             let mut extractor = encode::SliceExtractor::new_outboard(
                 Cursor::new(&input),
@@ -1721,13 +1721,13 @@ mod test {
         let v = vec![1u8, 2, 3];
         let hash = [0; 32].into();
 
-        let decoder = Decoder::new(io::Cursor::new(v.clone()), &hash);
+        let decoder: Decoder<_, _, 1> = Decoder::new(io::Cursor::new(v.clone()), &hash);
         let (inner_reader, outboard_reader) = decoder.into_inner();
         assert!(outboard_reader.is_none());
-        let slice_decoder = SliceDecoder::new(inner_reader, &hash, 0, 0);
+        let slice_decoder: SliceDecoder<_, 1> = SliceDecoder::new(inner_reader, &hash, 0, 0);
         assert_eq!(slice_decoder.into_inner().into_inner(), v);
 
-        let outboard_decoder = Decoder::new_outboard(&b""[..], &b""[..], &hash);
+        let outboard_decoder: Decoder<_, _, 1> = Decoder::new_outboard(&b""[..], &b""[..], &hash);
         let (_, outboard_reader) = outboard_decoder.into_inner();
         assert!(outboard_reader.is_some());
     }

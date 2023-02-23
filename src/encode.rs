@@ -38,7 +38,7 @@
 
 use crate::Finalization::{self, NotRoot, Root};
 use crate::{
-    ChunkGroupState, Hash, ParentNode, GROUP_SIZE, HASH_SIZE, HEADER_SIZE, MAX_DEPTH, PARENT_SIZE,
+    ChunkGroupState, Hash, ParentNode, GROUP_SIZE, HASH_SIZE, HEADER_SIZE, MAX_DEPTH, PARENT_SIZE, group_size,
 };
 use arrayref::array_mut_ref;
 use arrayvec::ArrayVec;
@@ -50,10 +50,10 @@ use std::io::SeekFrom;
 
 /// Encode an entire slice into a bytes vector in the default combined mode.
 /// This is a convenience wrapper around `Encoder::write_all`.
-pub fn encode(input: impl AsRef<[u8]>) -> (Vec<u8>, Hash) {
+pub fn encode<const GROUP_LOG: usize>(input: impl AsRef<[u8]>) -> (Vec<u8>, Hash) {
     let bytes = input.as_ref();
-    let mut vec = Vec::with_capacity(encoded_size(bytes.len() as u64) as usize);
-    let mut encoder = Encoder::new(io::Cursor::new(&mut vec));
+    let mut vec = Vec::with_capacity(encoded_size::<1>(bytes.len() as u64) as usize);
+    let mut encoder: Encoder<_, GROUP_LOG> = Encoder::new(io::Cursor::new(&mut vec));
     encoder.write_all(bytes).unwrap();
     let hash = encoder.finalize().unwrap();
     (vec, hash)
@@ -61,10 +61,10 @@ pub fn encode(input: impl AsRef<[u8]>) -> (Vec<u8>, Hash) {
 
 /// Encode an entire slice into a bytes vector in the outboard mode. This is a
 /// convenience wrapper around `Encoder::new_outboard` and `Encoder::write_all`.
-pub fn outboard(input: impl AsRef<[u8]>) -> (Vec<u8>, Hash) {
+pub fn outboard<const GROUP_LOG: usize>(input: impl AsRef<[u8]>) -> (Vec<u8>, Hash) {
     let bytes = input.as_ref();
-    let mut vec = Vec::with_capacity(outboard_size(bytes.len() as u64) as usize);
-    let mut encoder = Encoder::new_outboard(io::Cursor::new(&mut vec));
+    let mut vec = Vec::with_capacity(outboard_size::<1>(bytes.len() as u64) as usize);
+    let mut encoder: Encoder<_, GROUP_LOG> = Encoder::new_outboard(io::Cursor::new(&mut vec));
     encoder.write_all(bytes).unwrap();
     let hash = encoder.finalize().unwrap();
     (vec, hash)
@@ -72,40 +72,40 @@ pub fn outboard(input: impl AsRef<[u8]>) -> (Vec<u8>, Hash) {
 
 /// Compute the size of a combined encoding, given the size of the input. Note that for input sizes
 /// close to `u64::MAX`, the result can overflow a `u64`.
-pub fn encoded_size(content_len: u64) -> u128 {
-    content_len as u128 + outboard_size(content_len)
+pub fn encoded_size<const GROUP_CHUNKS: usize>(content_len: u64) -> u128 {
+    content_len as u128 + outboard_size::<GROUP_CHUNKS>(content_len)
 }
 
 /// Compute the size of an outboard encoding, given the size of the input.
-pub fn outboard_size(content_len: u64) -> u128 {
+pub fn outboard_size<const GROUP_CHUNKS: usize>(content_len: u64) -> u128 {
     // Should the return type here really by u128? Two reasons: 1) It's convenient to use the same
     // type as encoded_size(), and 2) if we're ever experimenting with very small chunk sizes, we
     // could indeed overflow u64.
-    outboard_subtree_size(content_len) + HEADER_SIZE as u128
+    outboard_subtree_size::<GROUP_CHUNKS>(content_len) + HEADER_SIZE as u128
 }
 
-pub(crate) fn encoded_subtree_size(content_len: u64) -> u128 {
-    content_len as u128 + outboard_subtree_size(content_len)
+pub(crate) fn encoded_subtree_size<const GROUP_CHUNKS: usize>(content_len: u64) -> u128 {
+    content_len as u128 + outboard_subtree_size::<GROUP_CHUNKS>(content_len)
 }
 
-pub(crate) fn outboard_subtree_size(content_len: u64) -> u128 {
+pub(crate) fn outboard_subtree_size<const GROUP_CHUNKS: usize>(content_len: u64) -> u128 {
     // The number of parent nodes is always the number of chunks minus one. To see why this is true,
     // start with a single chunk and incrementally add chunks to the tree. Each new chunk always
     // brings one parent node along with it.
-    let num_parents = count_chunks(content_len) - 1;
+    let num_parents = count_chunks::<GROUP_CHUNKS>(content_len) - 1;
     num_parents as u128 * PARENT_SIZE as u128
 }
 
-pub(crate) fn count_chunks(content_len: u64) -> u64 {
+pub(crate) fn count_chunks<const GROUP_CHUNKS: usize>(content_len: u64) -> u64 {
     // Two things to watch out for here: the 0-length input still counts as 1 chunk, and we don't
     // want to overflow when content_len is u64::MAX_VALUE.
-    let full_chunks: u64 = content_len / GROUP_SIZE as u64;
-    let has_partial_chunk: bool = (content_len % GROUP_SIZE as u64) != 0;
+    let full_chunks: u64 = content_len / group_size(GROUP_CHUNKS) as u64;
+    let has_partial_chunk: bool = (content_len % group_size(GROUP_CHUNKS) as u64) != 0;
     cmp::max(1, full_chunks + has_partial_chunk as u64)
 }
 
-pub(crate) fn chunk_size(chunk_index: u64, content_len: u64) -> usize {
-    let chunk_start = chunk_index * GROUP_SIZE as u64;
+pub(crate) fn chunk_size<const GROUP_CHUNKS: usize>(chunk_index: u64, content_len: u64) -> usize {
+    let chunk_start = chunk_index * group_size(GROUP_CHUNKS) as u64;
     cmp::min(GROUP_SIZE, (content_len - chunk_start) as usize)
 }
 
@@ -179,7 +179,7 @@ pub(crate) fn pre_order_parent_nodes(chunk_index: u64, content_len: u64) -> u8 {
         // the other rule, but think about it before you copy/paste this.
         64 - x.leading_zeros()
     }
-    let total_chunks = count_chunks(content_len);
+    let total_chunks = count_chunks::<1>(content_len);
     debug_assert!(chunk_index < total_chunks);
     let total_chunks_after_this = total_chunks - chunk_index;
     let bit_length_rule = bit_length(total_chunks_after_this - 1);
@@ -195,7 +195,7 @@ pub(crate) fn pre_order_parent_nodes(chunk_index: u64, content_len: u64) -> u8 {
 // makes it possible encode without knowing the input length in advance, and without requiring
 // buffer space for the entire input.
 #[derive(Clone)]
-struct FlipperState {
+struct FlipperState<const GROUP_LOG: usize> {
     parents: ArrayVec<crate::ParentNode, MAX_DEPTH>,
     content_len: u64,
     last_chunk_moved: u64,
@@ -203,13 +203,13 @@ struct FlipperState {
     parents_available: u8,
 }
 
-impl FlipperState {
+impl<const GROUP_LOG: usize> FlipperState<GROUP_LOG> {
     pub fn new(content_len: u64) -> Self {
-        let total_chunks = count_chunks(content_len);
+        let total_chunks = count_chunks::<GROUP_LOG>(content_len);
         Self {
             parents: ArrayVec::new(),
             content_len,
-            last_chunk_moved: count_chunks(content_len), // one greater than the final chunk index
+            last_chunk_moved: count_chunks::<GROUP_LOG>(content_len), // one greater than the final chunk index
             parents_needed: post_order_parent_nodes_final(total_chunks - 1),
             parents_available: 0,
         }
@@ -223,7 +223,7 @@ impl FlipperState {
         } else if self.parents_needed > 0 {
             FlipperNext::FeedParent
         } else if self.last_chunk_moved > 0 {
-            FlipperNext::Chunk(chunk_size(self.last_chunk_moved - 1, self.content_len))
+            FlipperNext::Chunk(chunk_size::<GROUP_LOG>(self.last_chunk_moved - 1, self.content_len))
         } else {
             FlipperNext::Done
         }
@@ -257,7 +257,7 @@ impl FlipperState {
     }
 }
 
-impl fmt::Debug for FlipperState {
+impl<const GROUP_LOG: usize> fmt::Debug for FlipperState<GROUP_LOG> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "FlipperState {{ parents: {}, content_len: {}, last_chunk_moved: {}, parents_needed: {}, parents_available: {} }}",
                self.parents.len(), self.content_len, self.last_chunk_moved, self.parents_needed, self.parents_available)
@@ -409,7 +409,7 @@ impl fmt::Debug for State {
 /// # }
 /// ```
 #[derive(Clone, Debug)]
-pub struct Encoder<T: Read + Write + Seek> {
+pub struct Encoder<T: Read + Write + Seek, const GROUP_LOG: usize> {
     inner: T,
     chunk_state: ChunkGroupState,
     tree_state: State,
@@ -417,7 +417,7 @@ pub struct Encoder<T: Read + Write + Seek> {
     finalized: bool,
 }
 
-impl<T: Read + Write + Seek> Encoder<T> {
+impl<T: Read + Write + Seek, const GROUP_LOG: usize> Encoder<T, GROUP_LOG> {
     /// Create a new `Encoder` that will produce a combined encoding.The encoding will contain all
     /// the input bytes, so that it can be decoded without the original input file. This is what
     /// you get from `bao encode`.
@@ -502,7 +502,7 @@ impl<T: Read + Write + Seek> Encoder<T> {
         self.inner.seek(SeekFrom::Start(read_cursor))?;
         self.inner.read_exact(&mut header)?;
         let content_len = crate::decode_len(&header);
-        let mut flipper = FlipperState::new(content_len);
+        let mut flipper = FlipperState::<GROUP_LOG>::new(content_len);
         loop {
             match flipper.next() {
                 FlipperNext::FeedParent => {
@@ -546,7 +546,7 @@ impl<T: Read + Write + Seek> Encoder<T> {
     }
 }
 
-impl<T: Read + Write + Seek> Write for Encoder<T> {
+impl<T: Read + Write + Seek, const GROUP_LOG: usize> Write for Encoder<T, GROUP_LOG> {
     fn write(&mut self, input: &[u8]) -> io::Result<usize> {
         assert!(!self.finalized, "already finalized");
 
@@ -698,7 +698,7 @@ impl ParseState {
             NextRead::Parent
         } else {
             NextRead::Chunk {
-                size: chunk_size(self.next_chunk_index(), content_len),
+                size: chunk_size::<GROUP_LOG>(self.next_chunk_index(), content_len),
                 finalization: self.finalization(),
                 skip: (self.content_position % GROUP_SIZE as u64) as usize,
                 index: self.content_position / GROUP_SIZE as u64,
@@ -1300,7 +1300,7 @@ mod test {
         let mut state = State::new();
         let mut chunk_index = 0;
         while input.len() > GROUP_SIZE {
-            let hash = ChunkGroupState::new(chunk_index)
+            let hash = ChunkGroupState::<1>::new(chunk_index)
                 .update(&input[..GROUP_SIZE])
                 .finalize(false);
             chunk_index += 1;
@@ -1310,7 +1310,7 @@ mod test {
             // them, but we need to avoid tripping an assert.
             while state.merge_parent().is_some() {}
         }
-        let hash = ChunkGroupState::new(chunk_index)
+        let hash = ChunkGroupState::<1>::new(chunk_index)
             .update(input)
             .finalize(last_chunk_is_root);
         state.push_subtree(&hash, input.len());

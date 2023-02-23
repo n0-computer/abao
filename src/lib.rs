@@ -51,7 +51,7 @@ use std::mem;
 /// The size of a `Hash`, 32 bytes.
 pub const HASH_SIZE: usize = 32;
 /// log2(GROUP_CHUNKS)
-pub(crate) const GROUP_LOG: usize = 4;
+pub(crate) const GROUP_LOG: usize = 1;
 /// The number of chunks in a chunk groups. Must be a power of 2.
 pub(crate) const GROUP_CHUNKS: usize = 1 << GROUP_LOG;
 /// The size of a chunk group in bytes.
@@ -60,6 +60,10 @@ pub(crate) const PARENT_SIZE: usize = 2 * HASH_SIZE;
 pub(crate) const HEADER_SIZE: usize = 8;
 const CHUNK_SIZE: usize = 1024;
 pub(crate) const MAX_DEPTH: usize = 64 - (GROUP_LOG + 10); // chunk size is 2^10
+
+pub(crate) fn group_size(group_log: usize) -> usize {
+    group_log << 10
+}
 
 /// An array of `HASH_SIZE` bytes. This will be a wrapper type in a future version.
 pub(crate) type ParentNode = [u8; 2 * HASH_SIZE];
@@ -127,25 +131,29 @@ pub(crate) mod test {
     ];
 }
 
+const fn group_chunks(group_log: usize) -> usize {
+    1 << group_log
+}
+
 /// A state machine for hashing a chunk group, with the same API as
 /// `blake3::guts::ChunkState`. This really should not exist but instead
 /// call into blake3, but the required methods are not public.
 ///
 /// See https://github.com/BLAKE3-team/BLAKE3/tree/more_guts
 #[derive(Clone, Debug)]
-pub(crate) struct ChunkGroupState {
+pub(crate) struct ChunkGroupState<const GROUP_CHUNKS: usize = 1> {
     current_chunk: u64,
-    leaf_hashes: [Hash; GROUP_CHUNKS - 1],
+    leaf_hashes: [Hash; GROUP_CHUNKS],
     current: blake3::guts::ChunkState,
 }
 
-impl ChunkGroupState {
+impl<const GROUP_CHUNKS: usize> ChunkGroupState<GROUP_CHUNKS> {
     pub fn new(group_counter: u64) -> Self {
         let chunk_counter = group_counter << GROUP_LOG;
         Self {
             current_chunk: chunk_counter,
             current: blake3::guts::ChunkState::new(chunk_counter),
-            leaf_hashes: [Hash::from([0; HASH_SIZE]); GROUP_CHUNKS - 1],
+            leaf_hashes: [Hash::from([0; HASH_SIZE]); GROUP_CHUNKS],
         }
     }
 
@@ -174,7 +182,6 @@ impl ChunkGroupState {
             // we have just current, so pass through is_root
             self.current.finalize(is_root)
         } else {
-            // todo: this works only for GROUP_CHUNKS == 2
             let mut leaf_hashes = [Hash::from([0; HASH_SIZE]); GROUP_CHUNKS];
             let n = self.hashes();
             leaf_hashes[..n].copy_from_slice(&self.leaf_hashes[..self.hashes()]);

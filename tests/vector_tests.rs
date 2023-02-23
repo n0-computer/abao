@@ -119,12 +119,12 @@ fn test_encode_vectors() {
         assert_eq!(encoded_size, encoded.len());
 
         // Test decoding.
-        let output = bao::decode::decode(&encoded, &hash).unwrap();
+        let output = bao::decode::decode::<1>(&encoded, &hash).unwrap();
         assert_eq!(input, output);
 
         // Make sure decoding with a bad hash fails.
         let bad_hash = corrupt_hash(&hash);
-        let err = bao::decode::decode(&encoded, &bad_hash).unwrap_err();
+        let err = bao::decode::decode::<1>(&encoded, &bad_hash).unwrap_err();
         assert_eq!(std::io::ErrorKind::InvalidData, err.kind());
 
         // Make sure each corruption point fails the decode.
@@ -134,13 +134,13 @@ fn test_encode_vectors() {
             corrupt[point] ^= 1;
             // The error can be either HashMismatch or Truncated, depending on whether the header
             // was corrupted.
-            bao::decode::decode(&corrupt, &hash).unwrap_err();
+            bao::decode::decode::<1>(&corrupt, &hash).unwrap_err();
         }
     }
 }
 
 fn decode_outboard(input: &[u8], outboard: &[u8], hash: &Hash) -> io::Result<Vec<u8>> {
-    let mut reader = bao::decode::Decoder::new_outboard(input, outboard, hash);
+    let mut reader: bao::decode::Decoder<_, _, 1> = bao::decode::Decoder::new_outboard(input, outboard, hash);
     let mut output = Vec::with_capacity(input.len());
     reader.read_to_end(&mut output)?;
     Ok(output)
@@ -207,7 +207,7 @@ fn test_seek_vectors() {
             let expected_input = &input[capped_seek..];
 
             // Test seeking in the combined mode.
-            let mut combined_reader = bao::decode::Decoder::new(Cursor::new(&encoded), &hash);
+            let mut combined_reader: bao::decode::Decoder<_, _, 1> = bao::decode::Decoder::new(Cursor::new(&encoded), &hash);
             combined_reader
                 .seek(io::SeekFrom::Start(seek as u64))
                 .unwrap();
@@ -216,7 +216,7 @@ fn test_seek_vectors() {
             assert_eq!(expected_input, &*combined_output);
 
             // Test seeking in the outboard mode.
-            let mut outboard_reader = bao::decode::Decoder::new_outboard(
+            let mut outboard_reader: bao::decode::Decoder<_, _, 1> = bao::decode::Decoder::new_outboard(
                 Cursor::new(&input),
                 Cursor::new(&outboard),
                 &hash,
@@ -239,8 +239,8 @@ fn test_seek_vectors() {
             repeated_seeks.push(x);
             repeated_seeks.push(y);
         }
-        let mut combined_reader = bao::decode::Decoder::new(Cursor::new(&encoded), &hash);
-        let mut outboard_reader =
+        let mut combined_reader: bao::decode::Decoder<_, _, 1> = bao::decode::Decoder::new(Cursor::new(&encoded), &hash);
+        let mut outboard_reader: bao::decode::Decoder<_, _, 1> =
             bao::decode::Decoder::new_outboard(Cursor::new(&input), Cursor::new(&outboard), &hash);
         println!();
         for &seek in &repeated_seeks {
@@ -271,7 +271,7 @@ fn test_seek_vectors() {
 }
 
 fn decode_slice(slice: &[u8], hash: &Hash, start: u64, len: u64) -> io::Result<Vec<u8>> {
-    let mut reader = bao::decode::SliceDecoder::new(slice, hash, start, len);
+    let mut reader: bao::decode::SliceDecoder<_, 1> = bao::decode::SliceDecoder::new(slice, hash, start, len);
     let mut output = Vec::new();
     reader.read_to_end(&mut output)?;
     Ok(output)
