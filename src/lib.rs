@@ -59,7 +59,7 @@ pub(crate) const GROUP_SIZE: usize = GROUP_CHUNKS * CHUNK_SIZE;
 pub(crate) const PARENT_SIZE: usize = 2 * HASH_SIZE;
 pub(crate) const HEADER_SIZE: usize = 8;
 const CHUNK_SIZE: usize = 1024;
-pub(crate) const MAX_DEPTH: usize = 54 - GROUP_LOG; // 2^54 * CHUNK_SIZE = 2^64
+pub(crate) const MAX_DEPTH: usize = 64 - (GROUP_LOG + 10); // chunk size is 2^10
 
 /// An array of `HASH_SIZE` bytes. This will be a wrapper type in a future version.
 pub(crate) type ParentNode = [u8; 2 * HASH_SIZE];
