@@ -1,5 +1,15 @@
 This is a fork of [https://github.com/oconnor663/bao] that adds async support and chunk groups.
 
+# Chunk groups
+
+As an extension of the original bao crate, this crate implements chunk groups.
+Chunk groups can be selected using a (mutually exclusive) feature flag.
+
+Supported chunk groups are from 1kb (1 chunk per group, compatible with the
+orininal bao crate) to 1024kb (2^10 chunks per group).
+
+The default is 16kb, so 2^4 chunks per group.
+
 # <a href="#"><img src="docs/bao.svg" alt="Bao" height=100></a> &nbsp; [![Actions Status](https://github.com/n0-computer/abao/workflows/tests/badge.svg)](https://github.com/n0-computer/abao/actions) [![docs.rs](https://docs.rs/abao/badge.svg)](https://docs.rs/abao) [![crates.io](https://img.shields.io/crates/v/abao.svg)](https://crates.io/crates/abao)
 
 [Bao Spec](docs/spec.md) — [Rust Crate](https://crates.io/crates/abao) — [Rust Docs](https://docs.rs/abao)
