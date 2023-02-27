@@ -17,7 +17,6 @@ futures = { version = "0.3", features = [], default-features = false, optional =
 tokio = { version = "1", features = [], default-features=false, optional = true }
 
 [features]
-# todo: remove before merge
 default = ["tokio_io", "group_size_16k"]
 tokio_io = ["tokio", "futures"]
 group_size_1k = [] # compatible with bao
