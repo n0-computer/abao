@@ -51,7 +51,28 @@ use std::mem;
 /// The size of a `Hash`, 32 bytes.
 pub const HASH_SIZE: usize = 32;
 /// log2(GROUP_CHUNKS)
+#[cfg(feature = "group_size_1k")]
+pub(crate) const GROUP_LOG: usize = 0;
+#[cfg(feature = "group_size_2k")]
+pub(crate) const GROUP_LOG: usize = 1;
+#[cfg(feature = "group_size_4k")]
+pub(crate) const GROUP_LOG: usize = 2;
+#[cfg(feature = "group_size_8k")]
+pub(crate) const GROUP_LOG: usize = 3;
+#[cfg(feature = "group_size_16k")]
 pub(crate) const GROUP_LOG: usize = 4;
+#[cfg(feature = "group_size_32k")]
+pub(crate) const GROUP_LOG: usize = 5;
+#[cfg(feature = "group_size_64k")]
+pub(crate) const GROUP_LOG: usize = 6;
+#[cfg(feature = "group_size_128k")]
+pub(crate) const GROUP_LOG: usize = 7;
+#[cfg(feature = "group_size_256k")]
+pub(crate) const GROUP_LOG: usize = 8;
+#[cfg(feature = "group_size_512k")]
+pub(crate) const GROUP_LOG: usize = 9;
+#[cfg(feature = "group_size_1024k")]
+pub(crate) const GROUP_LOG: usize = 10;
 /// The number of chunks in a chunk groups. Must be a power of 2.
 pub(crate) const GROUP_CHUNKS: usize = 1 << GROUP_LOG;
 /// The size of a chunk group in bytes.
