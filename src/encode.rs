@@ -441,6 +441,46 @@ impl<T: Read + Write + Seek> Encoder<T> {
         encoder
     }
 
+    /// Finalize, but don't flip to pre order
+    pub fn finalize_post_order(&mut self) -> io::Result<Hash> {
+        assert!(!self.finalized, "already finalized");
+        self.finalized = true;
+
+        // Compute the total len before we merge the final chunk into the
+        // tree_state.
+        let total_len = self
+            .tree_state
+            .count()
+            .checked_add(self.chunk_state.len() as u64)
+            .expect("addition overflowed");
+
+        // Finalize the last chunk. Note that any partial chunk bytes retained in the chunk_state
+        // have already been written to the underlying writer by .write().
+        debug_assert!(self.chunk_state.len() > 0 || self.tree_state.count() == 0);
+        let last_chunk_is_root = self.tree_state.count() == 0;
+        let last_chunk_hash = self.chunk_state.finalize(last_chunk_is_root);
+        self.tree_state
+            .push_subtree(&last_chunk_hash, self.chunk_state.len());
+
+        // Merge and write all the parents along the right edge.
+        let root_hash;
+        loop {
+            match self.tree_state.merge_finalize() {
+                StateFinish::Parent(parent) => self.inner.write_all(&parent)?,
+                StateFinish::Root(root) => {
+                    root_hash = root;
+                    break;
+                }
+            }
+        }
+
+        // Write the length header, at the end.
+        self.inner.write_all(&crate::encode_len(total_len))?;
+
+        Ok(root_hash)
+    }
+
+
     /// Finalize the encoding, after all the input has been written. You can't keep using this
     /// `Encoder` again after calling `finalize`, and writing or finalizing again will panic.
     ///
