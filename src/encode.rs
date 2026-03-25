@@ -495,6 +495,11 @@ impl<T: Read + Write + Seek> Encoder<T> {
         self.inner
     }
 
+    /// Return mutable reference to the underlying writer.
+    pub fn inner_mut(&mut self) -> &mut T {
+        &mut self.inner
+    }
+
     fn flip_post_order_stream(&mut self) -> io::Result<()> {
         let mut write_cursor = self.inner.seek(SeekFrom::End(0))?;
         let mut read_cursor = write_cursor - HEADER_SIZE as u64;
